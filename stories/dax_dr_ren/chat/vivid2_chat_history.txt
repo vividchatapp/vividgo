@@ -1,0 +1,6 @@
+user -----------
+What's Ren's last name
+
+assistant -----------
+Ren's last name is Takahashi.
+

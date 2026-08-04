@@ -1,0 +1,8 @@
+user -----------
+write a text to my wife
+
+assistant -----------
+Sorry, I encountered an error contacting the AI: failed to send request: Post "http://192.168.1.201:11434/api/chat": context deadline exceeded (Client.Timeout exceeded while awaiting headers)
+
+Use `resend` to resend your last message.
+

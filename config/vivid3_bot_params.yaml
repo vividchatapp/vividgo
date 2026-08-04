@@ -1,0 +1,11 @@
+selected_provider: 3
+current_model: phi3:3.8b
+current_mode: chat
+current_role: AssistantXXX
+current_story: text
+active_scenes:
+    - 2
+    - 1
+active_characters: []
+num_ctx: 8192
+nothink: false

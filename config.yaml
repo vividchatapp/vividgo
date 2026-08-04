@@ -1,0 +1,32 @@
+# Telegram Bot Configuration
+# Each bot has a name, token, and authorized user ID
+bots:
+  - name: "vivid1"
+    token: "8693119568:AAFoERPDxq5Cvtk6J0gx9LNCpKkEKLjEHwM"
+  - name: "vivid2"
+    token: "8620277934:AAGR0TCMiPVJRxU3dacQ3jEkgNrZFSKeGNE"
+  - name: "vivid3"
+    token: "8673470162:AAGCO3H_i3UmRvSpu56_c6QE1UAyBXeFl3c"
+user_id: 8786836755
+debug: true
+
+# Ollama API Configuration
+# Used to talk to ollama.com for online models
+ollama:
+  models:
+    - name: "primary"
+      api_key: "a588173917d746ce9cf7e33e386c697c.WVk-n6todD-lv5hG59rnsoQs"  # Your ollama.com API key
+      model: "gemma4:31b"  # Model to use (e.g., llama3.2, mistral, etc.)
+      api_base: "https://api.ollama.com"  # API base URL for this model
+    - name: "secondary"
+      api_key: "a588173917d746ce9cf7e33e386c697c.WVk-n6todD-lv5hG59rnsoQs"  # Your ollama.com API key
+      model: "gemma4:31b"  # Model to use (e.g., llama3.2, mistral, etc.)
+      api_base: "https://api.ollama.com"  # API base URL for this model
+    - name: "sloth"
+      api_key: "ollama"  # Your ollama.com API key
+      model: "gemma4:e4b"  # Model to use (e.g., llama3.2, mistral, etc.)
+      api_base: "http://sloth:11434"  # API base URL for this model
+    - name: "i5"
+      api_key: "ollama"  # Your ollama.com API key
+      model: "gemma4:e4b"  # Model to use (e.g., llama3.2, mistral, etc.)
+      api_base: "http://192.168.1.201:11434"  # API base URL for this model      

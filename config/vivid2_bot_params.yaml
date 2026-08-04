@@ -1,0 +1,12 @@
+selected_provider: 0
+current_model: devstral-2:123b
+current_mode: chat
+current_role: AssistantX
+current_story: dax_dr_ren
+active_scenes: []
+active_characters:
+    - 4
+    - 1
+    - 6
+num_ctx: 8192
+nothink: false

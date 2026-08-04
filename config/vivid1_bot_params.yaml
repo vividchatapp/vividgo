@@ -1,0 +1,12 @@
+selected_provider: 0
+current_model: gemma4:31b
+current_mode: story
+current_role: StoryWriter
+current_story: dax_dr_ren
+active_scenes: []
+active_characters:
+    - 1
+    - 6
+    - 4
+num_ctx: 65536
+nothink: false
