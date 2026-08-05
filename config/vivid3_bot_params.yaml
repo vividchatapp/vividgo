@@ -1,5 +1,5 @@
-selected_provider: 3
-current_model: phi3:3.8b
+selected_provider: 1
+current_model: gemma4:31b
 current_mode: chat
 current_role: AssistantXXX
 current_story: text

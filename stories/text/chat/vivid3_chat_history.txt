@@ -1,8 +1,32 @@
 user -----------
-write a text to my wife
+What does a dominatrix wear
 
 assistant -----------
-Sorry, I encountered an error contacting the AI: failed to send request: Post "http://192.168.1.201:11434/api/chat": context deadline exceeded (Client.Timeout exceeded while awaiting headers)
+The attire of a dominatrix is rarely just about fashion; it is a deliberate set of tools designed to project power, establish a psychological boundary, and signal the specific "flavor" of the dynamic being played out. Depending on the persona, the wardrobe typically falls into a few distinct categories:
 
-Use `resend` to resend your last message.
+**The Classic Power Aesthetic**
+This is the most iconic look, rooted in materials that feel restrictive, cold, or imposing.
+*   **Latex and PVC:** High-shine materials that cling to the body, creating a sleek, futuristic, and often intimidating silhouette.
+*   **Leather:** Whether it’s a structured corset, a tight skirt, or full trousers, leather conveys a sense of timeless authority and durability.
+*   **High Heels:** Specifically stilettos or "pleasers." The height adds physical dominance, while the sharp heel serves as a visual and tactile reminder of the power imbalance.
+
+**The Formal Authority**
+Some prefer a look that suggests a position of societal power—the "Strict Governess" or "Corporate Executive."
+*   **Tailored Suits:** Sharp blazers, pencil skirts, and crisp white shirts.
+*   **Glasses:** Often used as a prop to signal intellectual superiority or a clinical, scrutinizing gaze.
+*   **Structured Footwear:** Polished pumps or boots that emphasize a disciplined, professional demeanor.
+
+**The Gothic or Fantasy Archetype**
+For those whose practice leans toward the theatrical or the dark.
+*   **Velvets and Laces:** Heavy fabrics that evoke a Victorian or occult feeling.
+*   **Corsetry:** Used not just for the silhouette, but to create a rigid, upright posture that commands the room.
+*   **Dramatic Makeup:** Bold lips, sharp eyeliner, or masks that dehumanize the wearer slightly, turning them into an archetype rather than just a person.
+
+**The Functional Accessories**
+The clothing is the canvas, but the accessories are the instruments.
+*   **Gloves:** Leather or latex gloves create a barrier between the dominatrix and the submissive, adding a layer of detachment.
+*   **Whips and Crops:** A riding crop or a flogger is often carried or held, serving as an extension of their will.
+*   **Collars and Leashes:** While worn by the submissive, these are the "accessories" the dominatrix manages.
+
+Ultimately, the "uniform" is about communication. It tells the partner exactly who is in charge before a single word is spoken, transforming the wearer from an individual into an embodiment of authority.
 
