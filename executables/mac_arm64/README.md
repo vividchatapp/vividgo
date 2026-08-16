@@ -1,7 +1,7 @@
-# VividGo2 - macOS Apple Silicon
+# VividGo - macOS Apple Silicon
 
 **Platform:** macOS ARM64 (Apple Silicon) - Macs with M1, M2, M3, or M4 chips
-**File:** `vividgo2`
+**File:** `vividgo`
 
 ## System Requirements
 
@@ -10,19 +10,19 @@
 
 ## How to Run
 
-1. **Download** `vividgo2` from this folder
+1. **Download** `vividgo` from this folder
 2. **Open Terminal** and navigate to the download location
 3. **Make it executable** and run:
    ```bash
-   chmod +x vividgo2
-   ./vividgo2
+   chmod +x vividgo
+   ./vividgo
    ```
 4. On first run, the setup wizard will guide you through configuration
 
 > **Note:** macOS may block the executable because it's from an unidentified developer. To bypass this:
 > - Go to **System Settings > Privacy & Security**
 > - Scroll down and click **"Open Anyway"** next to the blocked message
-> - Or in Terminal, run: `xattr -d com.apple.quarantine vividgo2`
+> - Or in Terminal, run: `xattr -d com.apple.quarantine vividgo`
 
 ## Configuration
 

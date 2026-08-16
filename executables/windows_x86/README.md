@@ -1,7 +1,7 @@
-# VividGo2 - Windows x86 (32-bit)
+# VividGo - Windows x86 (32-bit)
 
 **Platform:** Windows 32-bit (x86)
-**File:** `vividgo2.exe`
+**File:** `vividgo.exe`
 
 ## System Requirements
 
@@ -10,10 +10,10 @@
 
 ## How to Run
 
-1. **Download** `vividgo2.exe` from this folder
+1. **Download** `vividgo.exe` from this folder
 2. **Double-click** the executable, or run from Command Prompt:
    ```
-   vividgo2.exe
+   vividgo.exe
    ```
 3. On first run, the setup wizard will guide you through configuration
 

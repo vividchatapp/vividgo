@@ -1,7 +1,7 @@
-# VividGo2 - FreeBSD x64
+# VividGo - FreeBSD x64
 
 **Platform:** FreeBSD 64-bit (x86_64)
-**File:** `vividgo2`
+**File:** `vividgo`
 
 ## System Requirements
 
@@ -10,11 +10,11 @@
 
 ## How to Run
 
-1. **Download** `vividgo2` from this folder
+1. **Download** `vividgo` from this folder
 2. **Make it executable** and run:
    ```bash
-   chmod +x vividgo2
-   ./vividgo2
+   chmod +x vividgo
+   ./vividgo
    ```
 3. On first run, the setup wizard will guide you through configuration
 
@@ -37,7 +37,7 @@ When you run the executable for the first time, it will:
 To run the bot as a background service on FreeBSD, create an rc script:
 
 ```bash
-sudo nano /usr/local/etc/rc.d/vividgo2
+sudo nano /usr/local/etc/rc.d/vividgo
 ```
 
 Add the following (adjust paths as needed):
@@ -45,16 +45,16 @@ Add the following (adjust paths as needed):
 ```sh
 #!/bin/sh
 
-# PROVIDE: vividgo2
+# PROVIDE: vividgo
 # REQUIRE: NETWORKING
 # KEYWORD: shutdown
 
 . /etc/rc.subr
 
-name="vividgo2"
-rcvar="vividgo2_enable"
+name="vividgo"
+rcvar="vividgo_enable"
 
-command="/path/to/vividgo2/vividgo2"
+command="/path/to/vividgo/vividgo"
 pidfile="/var/run/${name}.pid"
 command_interpreter="/nonexistent"
 
@@ -65,9 +65,9 @@ run_rc_command "$1"
 Make it executable and enable the service:
 
 ```bash
-sudo chmod +x /usr/local/etc/rc.d/vividgo2
-echo 'vividgo2_enable="YES"' | sudo tee -a /etc/rc.conf
-sudo service vividgo2 start
+sudo chmod +x /usr/local/etc/rc.d/vividgo
+echo 'vividgo_enable="YES"' | sudo tee -a /etc/rc.conf
+sudo service vividgo start
 ```
 
 ## Building from Source

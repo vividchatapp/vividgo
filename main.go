@@ -61,6 +61,14 @@ func logToFile(format string, args ...interface{}) {
 	}
 }
 
+// onOff returns "on" if b is true, otherwise "off".
+func onOff(b bool) string {
+	if b {
+		return "on"
+	}
+	return "off"
+}
+
 // BotConfig holds the configuration for a single bot
 type BotConfig struct {
 	Name  string `yaml:"name"`
@@ -92,6 +100,8 @@ type BotParams struct {
 	ActiveCharacters []int  `yaml:"active_characters"`
 	NumCtx           int    `yaml:"num_ctx"`
 	NoThink          bool   `yaml:"nothink"`
+	Voice            bool   `yaml:"voice"`
+	VoiceSpeed       int    `yaml:"voice_speed"`
 }
 
 // Config holds the bot configuration loaded from config.yaml or environment variables
@@ -344,6 +354,10 @@ func loadBotParams(botName string, defaultModel string) BotParams {
 	// Set default num_ctx if not set (legacy params files)
 	if params.NumCtx == 0 {
 		params.NumCtx = 8192
+	}
+	// Set default voice speed if not set (legacy params files)
+	if params.VoiceSpeed == 0 {
+		params.VoiceSpeed = 2
 	}
 
 	log.Printf("[%s] Loaded bot params from %s: provider=%d, model=%s, mode=%s, role=%s, story=%s, active_scenes=%v, active_characters=%v", botName, path, params.SelectedProvider, params.CurrentModel, params.CurrentMode, params.CurrentRole, params.CurrentStory, params.ActiveScenes, params.ActiveCharacters)
@@ -1104,6 +1118,34 @@ func deleteTrackedMessage(bot *tgbotapi.BotAPI, chatID int64, messageID int) boo
 	return true
 }
 
+// sendVoiceAudio generates MP3 audio from the given text using edge-tts-go
+// entirely in memory (no temp files) and sends it as an audio file to the chat,
+// if voice is enabled in botParams.
+// It logs errors but does not return them, so the caller's text flow is never interrupted.
+func sendVoiceAudio(bot *tgbotapi.BotAPI, chatID int64, text string, botName string, botParams *BotParams) {
+	if !botParams.Voice {
+		return
+	}
+
+	log.Printf("[%s] Generating voice audio (speed %d)...", botName, botParams.VoiceSpeed)
+	audioBytes, err := speakToBytes(text, botParams.VoiceSpeed)
+	if err != nil {
+		log.Printf("[%s] Failed to generate voice audio: %v", botName, err)
+		return
+	}
+
+	// Send the MP3 as an audio file via Telegram (in memory, no temp file)
+	audio := tgbotapi.NewAudio(chatID, tgbotapi.FileBytes{
+		Name:  "voice.mp3",
+		Bytes: audioBytes,
+	})
+	if sentMsg, err := bot.Send(audio); err != nil {
+		log.Printf("[%s] Failed to send voice audio: %v", botName, err)
+	} else {
+		log.Printf("[%s] Sent voice audio (message ID %d)", botName, sentMsg.MessageID)
+	}
+}
+
 func runBot(botCfg BotConfig, userID int64, ollamaCfg OllamaConfig, wg *sync.WaitGroup) {
 	defer wg.Done()
 
@@ -1257,6 +1299,9 @@ func runBot(botCfg BotConfig, userID int64, ollamaCfg OllamaConfig, wg *sync.Wai
 			}
 
 			var responseText string
+			// voiceThisResponse is set to true for AI-generated responses (chat and resend),
+			// so sendVoiceAudio is called after the text is sent. Command responses are not spoken.
+			voiceThisResponse := false
 
 			switch command {
 			case "help", "h":
@@ -1320,6 +1365,8 @@ func runBot(botCfg BotConfig, userID int64, ollamaCfg OllamaConfig, wg *sync.Wai
 • status - Show current settings
 • verbose - Toggle Verbose Status
 • trace [on/off] - Write payloads to context folder
+	• voice [on/off] - Speak AI responses as audio
+	• voice speed [1-10] - Set voice speed (10% increments)
 Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat, cl=clean, mf=modelsfiltered, sc=scene, hs=history, mo=mode, mc=llmctx`
 
 			case "provider", "p":
@@ -1776,6 +1823,11 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat,
 					sb.WriteString("🚫 NoThink: enabled\n")
 				}
 
+				// Voice flag
+				if botParams.Voice {
+					sb.WriteString(fmt.Sprintf("🔊 Voice: enabled (speed %d)\n", botParams.VoiceSpeed))
+				}
+
 				responseText = sb.String()
 				sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
 				continue
@@ -1820,6 +1872,37 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat,
 					responseText = "Verbose logging enabled."
 				} else {
 					responseText = "Verbose logging disabled."
+				}
+				sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
+				continue
+
+			case "voice":
+				// Voice output control: .voice on / .voice off / .voice speed <1-10> / .voice
+				if len(parts) >= 3 && strings.ToLower(parts[1]) == "speed" {
+					// .voice speed <1-10> - set voice speed (10% increments)
+					speed, err := strconv.Atoi(parts[2])
+					if err != nil || speed < 1 || speed > 10 {
+						responseText = fmt.Sprintf("Invalid voice speed. Please choose 1-10.\nCurrent speed: %d", botParams.VoiceSpeed)
+					} else {
+						botParams.VoiceSpeed = speed
+						saveBotParams(botCfg.Name, botParams)
+						responseText = fmt.Sprintf("Voice speed set to %d (+%d%%).", speed, speed*10)
+					}
+				} else if len(parts) == 2 {
+					arg := strings.ToLower(parts[1])
+					if arg == "on" {
+						botParams.Voice = true
+						saveBotParams(botCfg.Name, botParams)
+						responseText = "Voice output enabled. AI responses will include audio."
+					} else if arg == "off" {
+						botParams.Voice = false
+						saveBotParams(botCfg.Name, botParams)
+						responseText = "Voice output disabled."
+					} else {
+						responseText = fmt.Sprintf("Voice is %s, speed %d\nUsage: voice on/off or voice speed 1-10", onOff(botParams.Voice), botParams.VoiceSpeed)
+					}
+				} else {
+					responseText = fmt.Sprintf("Voice is %s, speed %d\nUsage: voice on/off or voice speed 1-10", onOff(botParams.Voice), botParams.VoiceSpeed)
 				}
 				sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
 				continue
@@ -2634,6 +2717,7 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat,
 
 				// Check context warning after processing response
 				sendContextWarning(conversationContext, botParams.NumCtx, botCfg.Name, update.Message.Chat.ID)
+				voiceThisResponse = true
 
 			default:
 				// If the message is a single word that is not a recognized command and not "continue",
@@ -2758,6 +2842,7 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat,
 
 				// Check context warning after processing response
 				sendContextWarning(conversationContext, botParams.NumCtx, botCfg.Name, update.Message.Chat.ID)
+				voiceThisResponse = true
 			}
 
 			// Use a safer maximum length for MarkdownV2 to account for escape characters
@@ -2803,6 +2888,11 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat,
 				}
 
 				remainingText = remainingText[len(chunk):]
+			}
+
+			// If this was an AI-generated response and voice is enabled, send the audio too
+			if voiceThisResponse {
+				sendVoiceAudio(bot, update.Message.Chat.ID, responseText, botCfg.Name, &botParams)
 			}
 		} else {
 			log.Printf("[%s] Ignored message from unauthorized user %d", botCfg.Name, update.Message.From.ID)

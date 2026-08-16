@@ -1,7 +1,7 @@
-# VividGo2 - Linux x86 (32-bit)
+# VividGo - Linux x86 (32-bit)
 
 **Platform:** Linux 32-bit (x86) - Older PCs and embedded systems
-**File:** `vividgo2`
+**File:** `vividgo`
 
 ## System Requirements
 
@@ -10,11 +10,11 @@
 
 ## How to Run
 
-1. **Download** `vividgo2` from this folder
+1. **Download** `vividgo` from this folder
 2. **Make it executable** and run:
    ```bash
-   chmod +x vividgo2
-   ./vividgo2
+   chmod +x vividgo
+   ./vividgo
    ```
 3. On first run, the setup wizard will guide you through configuration
 

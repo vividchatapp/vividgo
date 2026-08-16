@@ -1,7 +1,7 @@
-# VividGo2 - Windows ARM64
+# VividGo - Windows ARM64
 
 **Platform:** Windows on ARM (ARM64) - Surface Pro X, Surface Pro 9 5G, etc.
-**File:** `vividgo2.exe`
+**File:** `vividgo.exe`
 
 ## System Requirements
 
@@ -10,10 +10,10 @@
 
 ## How to Run
 
-1. **Download** `vividgo2.exe` from this folder
+1. **Download** `vividgo.exe` from this folder
 2. **Double-click** the executable, or run from Command Prompt / PowerShell:
    ```
-   vividgo2.exe
+   vividgo.exe
    ```
 3. On first run, the setup wizard will guide you through configuration
 

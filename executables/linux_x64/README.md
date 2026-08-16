@@ -1,7 +1,7 @@
-# VividGo2 - Linux x64
+# VividGo - Linux x64
 
 **Platform:** Linux 64-bit (x86_64) - Most desktop/server Linux distributions
-**File:** `vividgo2`
+**File:** `vividgo`
 
 ## System Requirements
 
@@ -11,11 +11,11 @@
 
 ## How to Run
 
-1. **Download** `vividgo2` from this folder
+1. **Download** `vividgo` from this folder
 2. **Make it executable** and run:
    ```bash
-   chmod +x vividgo2
-   ./vividgo2
+   chmod +x vividgo
+   ./vividgo
    ```
 3. On first run, the setup wizard will guide you through configuration
 
@@ -38,21 +38,21 @@ When you run the executable for the first time, it will:
 To run the bot as a background service, create a systemd service file:
 
 ```bash
-sudo nano /etc/systemd/system/vividgo2.service
+sudo nano /etc/systemd/system/vividgo.service
 ```
 
 Add the following (adjust paths as needed):
 
 ```ini
 [Unit]
-Description=VividGo2 Telegram Bot
+Description=VividGo Telegram Bot
 After=network.target
 
 [Service]
 Type=simple
 User=yourusername
-WorkingDirectory=/path/to/vividgo2
-ExecStart=/path/to/vividgo2/vividgo2
+WorkingDirectory=/path/to/vividgo
+ExecStart=/path/to/vividgo/vividgo
 Restart=on-failure
 RestartSec=10
 
@@ -64,8 +64,8 @@ Then enable and start the service:
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable vividgo2
-sudo systemctl start vividgo2
+sudo systemctl enable vividgo
+sudo systemctl start vividgo
 ```
 
 ## Building from Source

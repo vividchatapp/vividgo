@@ -1,7 +1,7 @@
-# VividGo2 - Raspberry Pi 3/4/5 (32-bit OS)
+# VividGo - Raspberry Pi 3/4/5 (32-bit OS)
 
 **Platform:** Linux ARMv7 (32-bit) - Raspberry Pi 3, 4, or 5 running 32-bit OS
-**File:** `vividgo2`
+**File:** `vividgo`
 
 ## System Requirements
 
@@ -11,11 +11,11 @@
 
 ## How to Run
 
-1. **Download** `vividgo2` from this folder
+1. **Download** `vividgo` from this folder
 2. **Make it executable** and run:
    ```bash
-   chmod +x vividgo2
-   ./vividgo2
+   chmod +x vividgo
+   ./vividgo
    ```
 3. On first run, the setup wizard will guide you through configuration
 
@@ -38,21 +38,21 @@ When you run the executable for the first time, it will:
 To run the bot as a background service:
 
 ```bash
-sudo nano /etc/systemd/system/vividgo2.service
+sudo nano /etc/systemd/system/vividgo.service
 ```
 
 Add the following (adjust paths as needed):
 
 ```ini
 [Unit]
-Description=VividGo2 Telegram Bot
+Description=VividGo Telegram Bot
 After=network.target
 
 [Service]
 Type=simple
 User=pi
-WorkingDirectory=/home/pi/vividgo2
-ExecStart=/home/pi/vividgo2/vividgo2
+WorkingDirectory=/home/pi/vividgo
+ExecStart=/home/pi/vividgo/vividgo
 Restart=on-failure
 RestartSec=10
 
@@ -64,8 +64,8 @@ Then enable and start the service:
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable vividgo2
-sudo systemctl start vividgo2
+sudo systemctl enable vividgo
+sudo systemctl start vividgo
 ```
 
 ## Building from Source

@@ -85,7 +85,7 @@ func readLinePassword(prompt, defaultValue string) string {
 func printBanner() {
 	fmt.Println()
 	fmt.Printf("%s╔══════════════════════════════════════════════════╗%s\n", colorCyan, colorReset)
-	fmt.Printf("%s║            %s🤖 VividGo2 Setup Wizard%s%s             ║%s\n", colorCyan, colorBold, colorReset, colorCyan, colorReset)
+	fmt.Printf("%s║            %s🤖 VividGo Setup Wizard%s%s             ║%s\n", colorCyan, colorBold, colorReset, colorCyan, colorReset)
 	fmt.Printf("%s╠══════════════════════════════════════════════════╣%s\n", colorCyan, colorReset)
 	fmt.Printf("%s║  This wizard will help you configure your        ║%s\n", colorCyan, colorReset)
 	fmt.Printf("%s║  Telegram AI bot. You'll need a few things:      ║%s\n", colorCyan, colorReset)
@@ -184,7 +184,7 @@ func downloadRolesFromGitHub() {
 	}
 
 	// Add a User-Agent header as required by GitHub API
-	req.Header.Set("User-Agent", "VividGo2-Setup/1.0")
+	req.Header.Set("User-Agent", "VividGo-Setup/1.0")
 
 	resp, err := client.Do(req)
 	if err != nil {
