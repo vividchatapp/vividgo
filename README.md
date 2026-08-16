@@ -2,6 +2,10 @@
 
 🤖 A multi-bot Telegram AI assistant powered by Ollama, with immersive story-writing, roleplay, voice output, and cross-platform builds.
 
+## 🚀 Quickstart — Download the Executable for Your Operating System
+
+Pre-built binaries are available for Windows, Linux, macOS, and FreeBSD. **Download the executable for your operating system here: [executables/readme.md](executables/readme.md)**
+
 ## ✨ Features
 
 ### Multi-Bot Support
@@ -32,7 +36,9 @@
 ### Voice Output
 - Speak AI responses as MP3 audio via Microsoft Edge's online TTS service
 - In-memory generation — no temporary files written to disk
-- Toggle per bot with `.voice on` / `.voice off`
+- Toggle per bot with `.voice [on/off]` - Speak AI responses as audio
+- `.voice speed [1-10]` - Set voice speed (10% increments)
+- `.voice char [on/off]` - Multi-voice character narration
 
 ### Conversation Management
 - Persistent chat history saved to disk (`stories/<story>/chat/<bot>_chat_history.txt`)
@@ -159,6 +165,8 @@ All commands start with a dot (`.`) or can be used without it. Type `.help` in T
 | `.verbose` | Toggle Verbose Status |
 | `.trace [on/off]` | Write payloads to context folder |
 | `.voice [on/off]` | Speak AI responses as audio |
+| `.voice speed [1-10]` | Set voice speed (10% increments) |
+| `.voice char [on/off]` | Multi-voice character narration |
 
 **Synonyms:** `r`=role, `rs`=rolesummary, `p`=provider, `m`=model, `s`=status, `h`=help, `c`=chat, `cl`=clean, `mf`=modelsfiltered, `sc`=scene, `hs`=history, `mo`=mode, `mc`=llmctx
 

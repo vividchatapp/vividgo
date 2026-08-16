@@ -1,7 +1,7 @@
 selected_provider: 1
 current_model: gemma4:31b
-current_mode: chat
-current_role: StoryWriter
+current_mode: story
+current_role: Assistant
 current_story: text
 active_scenes:
     - 2
@@ -11,3 +11,4 @@ num_ctx: 8192
 nothink: false
 voice: true
 voice_speed: 2
+voice_char: true

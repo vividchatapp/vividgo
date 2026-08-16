@@ -102,6 +102,7 @@ type BotParams struct {
 	NoThink          bool   `yaml:"nothink"`
 	Voice            bool   `yaml:"voice"`
 	VoiceSpeed       int    `yaml:"voice_speed"`
+	VoiceChar        bool   `yaml:"voice_char"`
 }
 
 // Config holds the bot configuration loaded from config.yaml or environment variables
@@ -1194,6 +1195,9 @@ func runBot(botCfg BotConfig, userID int64, ollamaCfg OllamaConfig, wg *sync.Wai
 	var lastAssistantMsgIDs []int
 	var lastUserText string
 
+	// Initialize voice character assignments (maps speaker name to assigned voice)
+	voiceCharAssignments := make(map[string]string)
+
 	// Initialize conversation context
 	var conversationContext []ContextMessage
 	contextLimit := 50
@@ -1367,6 +1371,7 @@ func runBot(botCfg BotConfig, userID int64, ollamaCfg OllamaConfig, wg *sync.Wai
 • trace [on/off] - Write payloads to context folder
 	• voice [on/off] - Speak AI responses as audio
 	• voice speed [1-10] - Set voice speed (10% increments)
+	• voice char [on/off] - Multi-voice character narration
 Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat, cl=clean, mf=modelsfiltered, sc=scene, hs=history, mo=mode, mc=llmctx`
 
 			case "provider", "p":
@@ -1615,6 +1620,7 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat,
 				}
 				ledger.Clear()
 				conversationContext = nil
+				voiceCharAssignments = make(map[string]string)
 				responseText = "Full cleanup complete. All messages deleted and memory wiped."
 				sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
 				continue
@@ -1825,7 +1831,11 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat,
 
 				// Voice flag
 				if botParams.Voice {
-					sb.WriteString(fmt.Sprintf("🔊 Voice: enabled (speed %d)\n", botParams.VoiceSpeed))
+					sb.WriteString(fmt.Sprintf("🔊 Voice: enabled (speed %d)", botParams.VoiceSpeed))
+					if botParams.VoiceChar {
+						sb.WriteString(" [char mode]")
+					}
+					sb.WriteString("\n")
 				}
 
 				responseText = sb.String()
@@ -1877,7 +1887,7 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat,
 				continue
 
 			case "voice":
-				// Voice output control: .voice on / .voice off / .voice speed <1-10> / .voice
+				// Voice output control: .voice on / .voice off / .voice speed <1-10> / .voice char [on/off]
 				if len(parts) >= 3 && strings.ToLower(parts[1]) == "speed" {
 					// .voice speed <1-10> - set voice speed (10% increments)
 					speed, err := strconv.Atoi(parts[2])
@@ -1888,21 +1898,36 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat,
 						saveBotParams(botCfg.Name, botParams)
 						responseText = fmt.Sprintf("Voice speed set to %d (+%d%%).", speed, speed*10)
 					}
-				} else if len(parts) == 2 {
-					arg := strings.ToLower(parts[1])
-					if arg == "on" {
-						botParams.Voice = true
-						saveBotParams(botCfg.Name, botParams)
-						responseText = "Voice output enabled. AI responses will include audio."
-					} else if arg == "off" {
-						botParams.Voice = false
-						saveBotParams(botCfg.Name, botParams)
-						responseText = "Voice output disabled."
+				} else if len(parts) >= 2 && strings.ToLower(parts[1]) == "char" {
+					// .voice char [on/off] - character voice mode (multiple voices per story)
+					if len(parts) >= 3 {
+						arg := strings.ToLower(parts[2])
+						if arg == "on" {
+							botParams.VoiceChar = true
+							botParams.Voice = true // char mode implies voice is on
+							saveBotParams(botCfg.Name, botParams)
+							responseText = "Character voice mode enabled. AI responses will use multiple character-specific voices.\nVoice generation can have longer delays."
+						} else if arg == "off" {
+							botParams.VoiceChar = false
+							voiceCharAssignments = make(map[string]string)
+							saveBotParams(botCfg.Name, botParams)
+							responseText = "Character voice mode disabled. Voice assignments cleared."
+						} else {
+							responseText = fmt.Sprintf("Voice char mode is %s\nUsage: voice char [on/off]", onOff(botParams.VoiceChar))
+						}
 					} else {
-						responseText = fmt.Sprintf("Voice is %s, speed %d\nUsage: voice on/off or voice speed 1-10", onOff(botParams.Voice), botParams.VoiceSpeed)
+						responseText = fmt.Sprintf("Voice char mode is %s\nUsage: voice char [on/off]", onOff(botParams.VoiceChar))
 					}
+				} else if len(parts) >= 2 && strings.ToLower(parts[1]) == "on" {
+					botParams.Voice = true
+					saveBotParams(botCfg.Name, botParams)
+					responseText = "Voice enabled. AI responses will include audio."
+				} else if len(parts) >= 2 && strings.ToLower(parts[1]) == "off" {
+					botParams.Voice = false
+					saveBotParams(botCfg.Name, botParams)
+					responseText = "Voice disabled."
 				} else {
-					responseText = fmt.Sprintf("Voice is %s, speed %d\nUsage: voice on/off or voice speed 1-10", onOff(botParams.Voice), botParams.VoiceSpeed)
+					responseText = fmt.Sprintf("Voice is %s, speed %d, char mode %s\nUsage: voice on/off, voice speed 1-10, voice char on/off", onOff(botParams.Voice), botParams.VoiceSpeed, onOff(botParams.VoiceChar))
 				}
 				sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
 				continue
@@ -2892,7 +2917,11 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat,
 
 			// If this was an AI-generated response and voice is enabled, send the audio too
 			if voiceThisResponse {
-				sendVoiceAudio(bot, update.Message.Chat.ID, responseText, botCfg.Name, &botParams)
+				if botParams.VoiceChar {
+					sendVoiceCharacterAudio(bot, update.Message.Chat.ID, responseText, botCfg.Name, &botParams, ollamaCfg.Models[selectedProvider], ollamaCfg.APIBase, &voiceCharAssignments, &ledger)
+				} else {
+					sendVoiceAudio(bot, update.Message.Chat.ID, responseText, botCfg.Name, &botParams)
+				}
 			}
 		} else {
 			log.Printf("[%s] Ignored message from unauthorized user %d", botCfg.Name, update.Message.From.ID)
