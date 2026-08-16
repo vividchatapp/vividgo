@@ -2,8 +2,25 @@ package main
 
 import (
 	"os"
+	"strings"
 	"testing"
 )
+
+func TestGetVoiceAssignmentsDisplay(t *testing.T) {
+	assignments := map[string]string{
+		"Dax":  "en-US-JennyNeural",
+		"Ren":  "en-GB-SoniaNeural",
+		"Sora": "en-US-GuyNeural",
+	}
+
+	got := GetVoiceAssignmentsDisplay(assignments)
+	if !strings.Contains(got, "Dax") || !strings.Contains(got, "en-US-JennyNeural") {
+		t.Fatalf("voice assignment list did not include character and selected voice: %q", got)
+	}
+	if !strings.Contains(got, "Ren") || !strings.Contains(got, "en-GB-SoniaNeural") {
+		t.Fatalf("voice assignment list did not include character and selected voice: %q", got)
+	}
+}
 
 func TestLoadBotParams(t *testing.T) {
 	// Check if config dir exists

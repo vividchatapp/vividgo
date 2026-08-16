@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/difyz9/edge-tts-go/pkg/communicate"
@@ -192,6 +193,49 @@ func voiceHintText(assignments map[string]string) string {
 	return sb.String()
 }
 
+// formatVoiceAssignments formats the character→voice assignments map as a
+// human-readable, sorted list suitable for display in a Telegram message.
+// Returns a friendly message when there are no assignments yet.
+func formatVoiceAssignments(assignments map[string]string) string {
+	if len(assignments) == 0 {
+		return "No character voice assignments yet. Assignments are created when character voice mode is used."
+	}
+	var sb strings.Builder
+	sb.WriteString("Character voice assignments:\n")
+	// Sort keys for consistent output
+	var names []string
+	for name := range assignments {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		fmt.Fprintf(&sb, "  %s: %s\n", name, assignments[name])
+	}
+	return sb.String()
+}
+
+// GetVoiceAssignmentsDisplay returns a readable summary of the current
+// character-to-voice mapping for display in the Telegram UI.
+func GetVoiceAssignmentsDisplay(assignments map[string]string) string {
+	return formatVoiceAssignments(assignments)
+}
+
+// SyncVoiceAssignments copies a runtime assignment map into the persisted bot params.
+func SyncVoiceAssignments(botParams *BotParams, assignments map[string]string) {
+	if botParams == nil {
+		return
+	}
+	if len(assignments) == 0 {
+		botParams.VoiceAssignments = nil
+		return
+	}
+	cloned := make(map[string]string, len(assignments))
+	for name, voice := range assignments {
+		cloned[name] = voice
+	}
+	botParams.VoiceAssignments = cloned
+}
+
 // sendVoiceCharacterAudio converts the latest story text into a multi-voice
 // spoken script using the roles/voiceAssistant.txt system prompt. It sends the
 // merged audio as a single Telegram file and tracks character→voice assignments
@@ -261,6 +305,10 @@ func sendVoiceCharacterAudio(bot *tgbotapi.BotAPI, chatID int64, text string, bo
 			segments[i].Voice = defaultVoice
 			(*assignments)[name] = defaultVoice
 		}
+	}
+	SyncVoiceAssignments(botParams, *assignments)
+	if botParams != nil {
+		saveBotParams(botName, *botParams)
 	}
 
 	// Clamp speed and build the rate string

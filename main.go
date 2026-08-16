@@ -91,18 +91,19 @@ type OllamaConfig struct {
 
 // BotParams holds per-bot persistent state loaded/saved to config/<botname>_bot_params.yaml
 type BotParams struct {
-	SelectedProvider int    `yaml:"selected_provider"`
-	CurrentModel     string `yaml:"current_model"`
-	CurrentMode      string `yaml:"current_mode"`
-	CurrentRole      string `yaml:"current_role"`
-	CurrentStory     string `yaml:"current_story"`
-	ActiveScenes     []int  `yaml:"active_scenes"`
-	ActiveCharacters []int  `yaml:"active_characters"`
-	NumCtx           int    `yaml:"num_ctx"`
-	NoThink          bool   `yaml:"nothink"`
-	Voice            bool   `yaml:"voice"`
-	VoiceSpeed       int    `yaml:"voice_speed"`
-	VoiceChar        bool   `yaml:"voice_char"`
+	SelectedProvider int               `yaml:"selected_provider"`
+	CurrentModel     string            `yaml:"current_model"`
+	CurrentMode      string            `yaml:"current_mode"`
+	CurrentRole      string            `yaml:"current_role"`
+	CurrentStory     string            `yaml:"current_story"`
+	ActiveScenes     []int             `yaml:"active_scenes"`
+	ActiveCharacters []int             `yaml:"active_characters"`
+	NumCtx           int               `yaml:"num_ctx"`
+	NoThink          bool              `yaml:"nothink"`
+	Voice            bool              `yaml:"voice"`
+	VoiceSpeed       int               `yaml:"voice_speed"`
+	VoiceChar        bool              `yaml:"voice_char"`
+	VoiceAssignments map[string]string `yaml:"voice_assignments"`
 }
 
 // Config holds the bot configuration loaded from config.yaml or environment variables
@@ -1197,6 +1198,13 @@ func runBot(botCfg BotConfig, userID int64, ollamaCfg OllamaConfig, wg *sync.Wai
 
 	// Initialize voice character assignments (maps speaker name to assigned voice)
 	voiceCharAssignments := make(map[string]string)
+	// Restore voice assignments from persisted params so they survive restarts
+	if botParams.VoiceAssignments != nil {
+		for k, v := range botParams.VoiceAssignments {
+			voiceCharAssignments[k] = v
+		}
+	}
+	SyncVoiceAssignments(&botParams, voiceCharAssignments)
 
 	// Initialize conversation context
 	var conversationContext []ContextMessage
@@ -1372,6 +1380,8 @@ func runBot(botCfg BotConfig, userID int64, ollamaCfg OllamaConfig, wg *sync.Wai
 	• voice [on/off] - Speak AI responses as audio
 	• voice speed [1-10] - Set voice speed (10% increments)
 	• voice char [on/off] - Multi-voice character narration
+	• voice list - Show character voice assignments
+	• voice list - Show character voice assignments
 Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat, cl=clean, mf=modelsfiltered, sc=scene, hs=history, mo=mode, mc=llmctx`
 
 			case "provider", "p":
@@ -1909,7 +1919,9 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat,
 							responseText = "Character voice mode enabled. AI responses will use multiple character-specific voices.\nVoice generation can have longer delays."
 						} else if arg == "off" {
 							botParams.VoiceChar = false
+							botParams.VoiceAssignments = nil
 							voiceCharAssignments = make(map[string]string)
+							SyncVoiceAssignments(&botParams, voiceCharAssignments)
 							saveBotParams(botCfg.Name, botParams)
 							responseText = "Character voice mode disabled. Voice assignments cleared."
 						} else {
@@ -1926,8 +1938,12 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat,
 					botParams.Voice = false
 					saveBotParams(botCfg.Name, botParams)
 					responseText = "Voice disabled."
+				} else if len(parts) >= 2 && strings.ToLower(parts[1]) == "list" {
+					// .voice list - show character→voice assignments
+					SyncVoiceAssignments(&botParams, voiceCharAssignments)
+					responseText = GetVoiceAssignmentsDisplay(voiceCharAssignments)
 				} else {
-					responseText = fmt.Sprintf("Voice is %s, speed %d, char mode %s\nUsage: voice on/off, voice speed 1-10, voice char on/off", onOff(botParams.Voice), botParams.VoiceSpeed, onOff(botParams.VoiceChar))
+					responseText = fmt.Sprintf("Voice is %s, speed %d, char mode %s\nUsage: voice on/off, voice speed 1-10, voice char on/off, voice list", onOff(botParams.Voice), botParams.VoiceSpeed, onOff(botParams.VoiceChar))
 				}
 				sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
 				continue
