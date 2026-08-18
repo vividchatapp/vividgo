@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -61,6 +62,126 @@ func logToFile(format string, args ...interface{}) {
 	}
 }
 
+// maxTraceFilesPerBot limits how many trace payload files are kept per bot.
+const maxTraceFilesPerBot = 10
+
+// traceDir is the root folder for trace payload files.
+const traceDir = "context"
+
+// traceMu serializes trace file writes and pruning across bot goroutines.
+var traceMu sync.Mutex
+
+// sanitizeFilename makes a string safe to use in a filename/folder name
+// on all platforms.
+func sanitizeFilename(name string) string {
+	safe := strings.NewReplacer(
+		"https://", "",
+		"http://", "",
+		"/", "_",
+		"\\", "_",
+		";", "_",
+		"*", "_",
+		"\"", "_",
+		"<", "_",
+		">", "_",
+		"|", "_",
+	).Replace(name)
+	if safe == "" {
+		safe = "unknown"
+	}
+	return safe
+}
+
+// pruneTraceFiles removes the oldest trace files in a bot's directory
+// beyond maxTraceFilesPerBot.
+func pruneTraceFiles(botTraceDir string) {
+	entries, err := os.ReadDir(botTraceDir)
+	if err != nil {
+		return
+	}
+	if len(entries) <= maxTraceFilesPerBot {
+		return
+	}
+
+	// Sort by modification time (oldest first)
+	sort.Slice(entries, func(i, j int) bool {
+		infoI, errI := entries[i].Info()
+		infoJ, errJ := entries[j].Info()
+		if errI != nil || errJ != nil {
+			return false
+		}
+		return infoI.ModTime().Before(infoJ.ModTime())
+	})
+
+	// Delete the oldest files beyond the cap
+	toRemove := len(entries) - maxTraceFilesPerBot
+	for i := 0; i < toRemove; i++ {
+		path := filepath.Join(botTraceDir, entries[i].Name())
+		if err := os.Remove(path); err != nil {
+			log.Printf("Failed to prune trace file %s: %v", path, err)
+		} else {
+			log.Printf("Pruned old trace file %s", path)
+		}
+	}
+}
+
+// traceRequestPayload writes the exact LLM request payload (the full context
+// sent to the model: system prompt + conversation history + user message)
+// to the context/<bot>/ folder when trace mode is enabled.
+// Each request gets its own timestamped file so it can be inspected.
+// A maximum of maxTraceFilesPerBot are kept per bot; the oldest are pruned.
+func traceRequestPayload(botName string, endpoint string, model string, jsonData []byte) {
+	if !logToFileEnabled {
+		return
+	}
+
+	traceMu.Lock()
+	defer traceMu.Unlock()
+
+	// Sanitize the bot name so it is safe to use in a folder name on all platforms.
+	safeBot := sanitizeFilename(botName)
+	botTraceDir := filepath.Join(traceDir, safeBot)
+	if err := os.MkdirAll(botTraceDir, 0755); err != nil {
+		log.Printf("Failed to create trace directory %s: %v", botTraceDir, err)
+		return
+	}
+
+	// Wrap the raw request body with metadata so the file is self-contained.
+	payload := struct {
+		Timestamp string          `json:"timestamp"`
+		Endpoint  string          `json:"endpoint"`
+		Model     string          `json:"model"`
+		Request   json.RawMessage `json:"request"`
+	}{
+		Timestamp: time.Now().Format(time.RFC3339),
+		Endpoint:  endpoint,
+		Model:     model,
+		Request:   jsonData,
+	}
+
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		log.Printf("Failed to marshal trace payload: %v", err)
+		return
+	}
+
+	// Sanitize the endpoint so it is safe to use in a filename on all platforms.
+	safeName := sanitizeFilename(endpoint)
+	if safeName == "unknown" {
+		safeName = "request"
+	}
+
+	path := filepath.Join(botTraceDir, fmt.Sprintf("%s_%d.json", safeName, time.Now().UnixNano()))
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		log.Printf("Failed to write trace payload to %s: %v", path, err)
+		return
+	}
+	log.Printf("Trace payload written to %s", path)
+
+	// Enforce the per-bot file cap by pruning the oldest files.
+	pruneTraceFiles(botTraceDir)
+}
+
 // onOff returns "on" if b is true, otherwise "off".
 func onOff(b bool) string {
 	if b {
@@ -103,6 +224,7 @@ type BotParams struct {
 	Voice            bool              `yaml:"voice"`
 	VoiceSpeed       int               `yaml:"voice_speed"`
 	VoiceChar        bool              `yaml:"voice_char"`
+	VoiceStripPunct  bool              `yaml:"voice_strip_punct"`
 	VoiceAssignments map[string]string `yaml:"voice_assignments"`
 }
 
@@ -360,6 +482,12 @@ func loadBotParams(botName string, defaultModel string) BotParams {
 	// Set default voice speed if not set (legacy params files)
 	if params.VoiceSpeed == 0 {
 		params.VoiceSpeed = 2
+	}
+	// Set default voice strip punctuation if not set (legacy params files).
+	// Defaults to true so the TTS pause fix works immediately; set
+	// voice_strip_punct: false in the YAML to disable it.
+	if !params.VoiceStripPunct && !strings.Contains(string(data), "voice_strip_punct") {
+		params.VoiceStripPunct = true
 	}
 
 	log.Printf("[%s] Loaded bot params from %s: provider=%d, model=%s, mode=%s, role=%s, story=%s, active_scenes=%v, active_characters=%v", botName, path, params.SelectedProvider, params.CurrentModel, params.CurrentMode, params.CurrentRole, params.CurrentStory, params.ActiveScenes, params.ActiveCharacters)
@@ -801,7 +929,7 @@ func saveFilteredModels(models []string) {
 }
 
 // callOllamaAPI sends a chat request to the Ollama API and returns the response text
-func callOllamaAPI(apiBase string, modelEntry ModelEntry, systemPrompt string, context []ContextMessage, userMessage string, numCtx int, noThink bool) (string, error) {
+func callOllamaAPI(botName string, apiBase string, modelEntry ModelEntry, systemPrompt string, context []ContextMessage, userMessage string, numCtx int, noThink bool) (string, error) {
 	// Determine the endpoint URL
 	// Use the native Ollama API endpoint /api/chat
 	baseURL := strings.TrimRight(apiBase, "/")
@@ -838,9 +966,14 @@ func callOllamaAPI(apiBase string, modelEntry ModelEntry, systemPrompt string, c
 		return "", fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	logToFile("[Ollama Request] Endpoint: %s", endpoint)
-	logToFile("[Ollama Request] Model: %s", modelEntry.Model)
-	logToFile("[Ollama Request] Body: %s", string(jsonData))
+	if logToFileEnabled {
+		logToFile("[Ollama Request] Endpoint: %s", endpoint)
+		logToFile("[Ollama Request] Model: %s", modelEntry.Model)
+	}
+
+	// When trace mode is on, save the exact payload sent to the LLM
+	// (system prompt + full context + user message) to the context/ folder.
+	traceRequestPayload(botName, endpoint, modelEntry.Model, jsonData)
 
 	// Create HTTP request
 	req, err := http.NewRequest("POST", endpoint, bytes.NewBuffer(jsonData))
@@ -870,7 +1003,7 @@ func callOllamaAPI(apiBase string, modelEntry ModelEntry, systemPrompt string, c
 		// If /api/chat fails with 405, try the OpenAI-compatible endpoint as fallback
 		if resp.StatusCode == http.StatusMethodNotAllowed {
 			fallbackEndpoint := baseURL + "/v1/chat/completions"
-			return callOllamaAPIOpenAI(fallbackEndpoint, modelEntry, systemPrompt, context, userMessage)
+			return callOllamaAPIOpenAI(botName, fallbackEndpoint, modelEntry, systemPrompt, context, userMessage)
 		}
 		return "", fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
 	}
@@ -889,7 +1022,7 @@ func callOllamaAPI(apiBase string, modelEntry ModelEntry, systemPrompt string, c
 }
 
 // callOllamaAPIOpenAI sends a chat request using the OpenAI-compatible endpoint format
-func callOllamaAPIOpenAI(endpoint string, modelEntry ModelEntry, systemPrompt string, context []ContextMessage, userMessage string) (string, error) {
+func callOllamaAPIOpenAI(botName string, endpoint string, modelEntry ModelEntry, systemPrompt string, context []ContextMessage, userMessage string) (string, error) {
 	// Build the request in OpenAI-compatible format
 	messages := []OllamaMessage{
 		{
@@ -917,6 +1050,11 @@ func callOllamaAPIOpenAI(endpoint string, modelEntry ModelEntry, systemPrompt st
 		return "", fmt.Errorf("failed to marshal request: %w", err)
 	}
 
+	// When trace mode is on, save the exact payload sent to the LLM
+	// (system prompt + full context + user message) to the context/ folder.
+	traceRequestPayload(botName, endpoint, modelEntry.Model, jsonData)
+
+	// Create HTTP request
 	req, err := http.NewRequest("POST", endpoint, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: %w", err)
@@ -1130,7 +1268,7 @@ func sendVoiceAudio(bot *tgbotapi.BotAPI, chatID int64, text string, botName str
 	}
 
 	log.Printf("[%s] Generating voice audio (speed %d)...", botName, botParams.VoiceSpeed)
-	audioBytes, err := speakToBytes(text, botParams.VoiceSpeed)
+	audioBytes, err := speakToBytes(text, botParams.VoiceSpeed, botParams.VoiceStripPunct)
 	if err != nil {
 		log.Printf("[%s] Failed to generate voice audio: %v", botName, err)
 		return
@@ -2323,10 +2461,10 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat,
 					arg := strings.ToLower(parts[1])
 					if arg == "on" {
 						logToFileEnabled = true
-						responseText = "Trace logging enabled."
+						responseText = fmt.Sprintf("Trace enabled. LLM request payloads will be written to context/<bot>/ (max %d per bot).", maxTraceFilesPerBot)
 					} else if arg == "off" {
 						logToFileEnabled = false
-						responseText = "Trace logging disabled."
+						responseText = "Trace disabled. No more payloads written."
 					} else {
 						responseText = fmt.Sprintf("Current trace: %v\nUsage: trace [on/off]", logToFileEnabled)
 					}
@@ -2685,7 +2823,7 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat,
 
 				// Call Ollama API
 				modelEntry := ollamaCfg.Models[selectedProvider]
-				askResponse, err := callOllamaAPI(getEffectiveAPIBase(modelEntry, ollamaCfg.APIBase), modelEntry, systemPrompt, apiContext, enrichedMessage, botParams.NumCtx, botParams.NoThink)
+				askResponse, err := callOllamaAPI(botCfg.Name, getEffectiveAPIBase(modelEntry, ollamaCfg.APIBase), modelEntry, systemPrompt, apiContext, enrichedMessage, botParams.NumCtx, botParams.NoThink)
 				if err != nil {
 					log.Printf("[%s] Ollama API error (ask): %v", botCfg.Name, err)
 					askResponse = fmt.Sprintf("Sorry, I encountered an error: %v", err)
@@ -2783,7 +2921,7 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat,
 				}
 
 				// Call Ollama API for a response with context
-				responseText, err = callOllamaAPI(getEffectiveAPIBase(modelEntry, ollamaCfg.APIBase), modelEntry, systemPrompt, apiContext, enrichedMessage, botParams.NumCtx, botParams.NoThink)
+				responseText, err = callOllamaAPI(botCfg.Name, getEffectiveAPIBase(modelEntry, ollamaCfg.APIBase), modelEntry, systemPrompt, apiContext, enrichedMessage, botParams.NumCtx, botParams.NoThink)
 				if err != nil {
 					log.Printf("[%s] Ollama API error (resend): %v", botCfg.Name, err)
 					responseText = fmt.Sprintf("Sorry, I encountered an error contacting the AI: %v\n\nUse `resend` to resend your last message.", err)
@@ -2908,7 +3046,7 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat,
 				}
 
 				// Call Ollama API for a response with context
-				responseText, err = callOllamaAPI(getEffectiveAPIBase(modelEntry, ollamaCfg.APIBase), modelEntry, systemPrompt, apiContext, enrichedMessage, botParams.NumCtx, botParams.NoThink)
+				responseText, err = callOllamaAPI(botCfg.Name, getEffectiveAPIBase(modelEntry, ollamaCfg.APIBase), modelEntry, systemPrompt, apiContext, enrichedMessage, botParams.NumCtx, botParams.NoThink)
 				if err != nil {
 					log.Printf("[%s] Ollama API error: %v", botCfg.Name, err)
 					responseText = fmt.Sprintf("Sorry, I encountered an error contacting the AI: %v\n\nUse `resend` to resend your last message.", err)

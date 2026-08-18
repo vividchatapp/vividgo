@@ -1,9 +1,12 @@
 package main
 
 import (
+	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestGetVoiceAssignmentsDisplay(t *testing.T) {
@@ -28,6 +31,80 @@ func TestGetVoiceAssignmentsDisplay(t *testing.T) {
 	if strings.Index(got, "Dax") > strings.Index(got, "Ren") ||
 		strings.Index(got, "Ren") > strings.Index(got, "Sora") {
 		t.Fatalf("voice assignment list is not sorted alphabetically: %q", got)
+	}
+}
+
+func TestStripPausePunctuation(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		// Punctuation inside double quotes is stripped
+		{`"You're a mess, Sarah?"`, `"You're a mess Sarah"`},
+		{`"Hello, world!"`, `"Hello world"`},
+		{`"What? Really?!"`, `"What Really"`},
+		{`"One, two; three: four."`, `"One two three four"`},
+		// Punctuation outside double quotes is preserved
+		{`He said, "Hello, world!" and left.`, `He said, "Hello world" and left.`},
+		{`"Stop!" she yelled.`, `"Stop" she yelled.`},
+		// No quotes - nothing changes
+		{`Hello, world!`, `Hello, world!`},
+		{`What? Really?!`, `What? Really?!`},
+		{`One, two; three: four.`, `One, two; three: four.`},
+		// Apostrophes preserved inside quotes
+		{`"You're a mess, Sarah?"`, `"You're a mess Sarah"`},
+		// Empty string
+		{"", ""},
+	}
+
+	for _, tt := range tests {
+		got := stripPausePunctuation(tt.input)
+		if got != tt.expected {
+			t.Errorf("stripPausePunctuation(%q) = %q, want %q", tt.input, got, tt.expected)
+		}
+	}
+}
+
+func TestPruneTraceFiles(t *testing.T) {
+	// Create a temp directory to simulate a bot's trace folder
+	dir := t.TempDir()
+
+	// Write 12 files with monotonically increasing modification times
+	for i := 0; i < 12; i++ {
+		name := filepath.Join(dir, fmt.Sprintf("trace_%02d.json", i))
+		if err := os.WriteFile(name, []byte("{}"), 0644); err != nil {
+			t.Fatalf("failed to create trace file %s: %v", name, err)
+		}
+		// Set mod time 1 minute apart so ordering is deterministic
+		modTime := time.Now().Add(time.Duration(i) * time.Minute)
+		if err := os.Chtimes(name, modTime, modTime); err != nil {
+			t.Fatalf("failed to set mod time on %s: %v", name, err)
+		}
+	}
+
+	// Prune should keep only the 10 newest files
+	pruneTraceFiles(dir)
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("failed to read temp dir: %v", err)
+	}
+	if len(entries) != maxTraceFilesPerBot {
+		t.Fatalf("expected %d files after pruning, got %d", maxTraceFilesPerBot, len(entries))
+	}
+
+	// Verify the two oldest files (trace_00.json, trace_01.json) were removed
+	for _, name := range []string{"trace_00.json", "trace_01.json"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
+			t.Errorf("expected %s to be pruned (oldest), but it still exists", name)
+		}
+	}
+
+	// Verify the newer files still exist
+	for _, name := range []string{"trace_10.json", "trace_11.json"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Errorf("expected %s to be kept (newest), but it was removed: %v", name, err)
+		}
 	}
 }
 

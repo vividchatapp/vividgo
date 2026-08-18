@@ -87,12 +87,43 @@ func stripMarkdown(text string) string {
 	return strings.TrimSpace(text)
 }
 
+// stripPausePunctuation removes punctuation characters ONLY from text inside
+// double quotes (dialogue). This prevents the TTS engine from inserting pauses
+// mid-dialogue (e.g. "You're a mess, Sarah?" becomes "You're a mess Sarah")
+// while leaving narration and non-quoted text untouched.
+// Apostrophes are preserved so contractions like "You're" still work.
+func stripPausePunctuation(text string) string {
+	// Find all double-quoted sections and strip punctuation from only those
+	re := regexp.MustCompile(`"([^"]*)"`)
+	return re.ReplaceAllStringFunc(text, func(match string) string {
+		// Extract the inner text (without the quotes)
+		inner := match[1 : len(match)-1]
+
+		// Remove pause-inducing punctuation from the dialogue text
+		// (keep apostrophes for contractions)
+		punctRe := regexp.MustCompile(`[.,!?;:()\[\]{}\-—–…]`)
+		inner = punctRe.ReplaceAllString(inner, " ")
+
+		// Collapse multiple spaces
+		spaceRe := regexp.MustCompile(`\s+`)
+		inner = spaceRe.ReplaceAllString(inner, " ")
+
+		// Rebuild with the quotes preserved
+		return `"` + strings.TrimSpace(inner) + `"`
+	})
+}
+
 // GenerateVoiceBuffer converts text to MP3 bytes in memory without touching disk.
 // It streams audio chunks directly into a bytes.Buffer in RAM.
 // This is a universal, cross-platform method that works on all devices
 // (Windows, Linux, macOS, etc.) via Microsoft Edge's online TTS service.
-func GenerateVoiceBuffer(text, voice, rate string) ([]byte, error) {
+// If stripPunct is true, all punctuation is removed before TTS to avoid
+// TTS-induced pauses between words.
+func GenerateVoiceBuffer(text, voice, rate string, stripPunct bool) ([]byte, error) {
 	cleaned := stripMarkdown(text)
+	if stripPunct {
+		cleaned = stripPausePunctuation(cleaned)
+	}
 	if cleaned == "" {
 		cleaned = "..."
 	}
@@ -138,7 +169,9 @@ func GenerateVoiceBuffer(text, voice, rate string) ([]byte, error) {
 // Microsoft Edge's online TTS service, returning the audio in memory.
 // No temporary files are written to disk.
 // speed is 1-10, where each increment adds +10% to the speech rate.
-func speakToBytes(text string, speed int) ([]byte, error) {
+// If stripPunct is true, all punctuation is removed before TTS to avoid
+// TTS-induced pauses between words.
+func speakToBytes(text string, speed int, stripPunct bool) ([]byte, error) {
 	// Clamp speed to valid range 1-10
 	if speed < 1 {
 		speed = 1
@@ -147,7 +180,7 @@ func speakToBytes(text string, speed int) ([]byte, error) {
 		speed = 10
 	}
 	rate := fmt.Sprintf("+%d%%", speed*10)
-	return GenerateVoiceBuffer(text, defaultVoice, rate)
+	return GenerateVoiceBuffer(text, defaultVoice, rate, stripPunct)
 }
 
 // parseVoiceSegments converts an LLM JSON response into a slice of voice segments.
@@ -260,7 +293,7 @@ func ChangeCharacterVoice(botName string, botParams *BotParams, modelEntry Model
 
 	// Call the LLM with NO conversation context
 	effectiveBase := getEffectiveAPIBase(modelEntry, apiBase)
-	scriptJSON, err := callOllamaAPI(effectiveBase, modelEntry, systemPrompt, nil, userMsg.String(), botParams.NumCtx, botParams.NoThink)
+	scriptJSON, err := callOllamaAPI(botName, effectiveBase, modelEntry, systemPrompt, nil, userMsg.String(), botParams.NumCtx, botParams.NoThink)
 	if err != nil {
 		return "", fmt.Errorf("voice selection LLM call failed: %w", err)
 	}
@@ -325,7 +358,7 @@ func sendVoiceCharacterAudio(bot *tgbotapi.BotAPI, chatID int64, text string, bo
 	// Call the LLM with NO conversation context (only the current response text)
 	// Use the effective API base (per-model override or global default).
 	effectiveBase := getEffectiveAPIBase(modelEntry, apiBase)
-	scriptJSON, err := callOllamaAPI(effectiveBase, modelEntry, systemPrompt, nil, userMsg.String(), botParams.NumCtx, botParams.NoThink)
+	scriptJSON, err := callOllamaAPI(botName, effectiveBase, modelEntry, systemPrompt, nil, userMsg.String(), botParams.NumCtx, botParams.NoThink)
 	if err != nil {
 		log.Printf("[%s] Character voice LLM call failed: %v", botName, err)
 		sendVoiceAudio(bot, chatID, text, botName, botParams) // fallback to single voice
@@ -382,7 +415,7 @@ func sendVoiceCharacterAudio(bot *tgbotapi.BotAPI, chatID int64, text string, bo
 	// Generate MP3 for each segment and concatenate into one combined audio file
 	var combined bytes.Buffer
 	for _, seg := range segments {
-		segBytes, err := GenerateVoiceBuffer(seg.Text, seg.Voice, rate)
+		segBytes, err := GenerateVoiceBuffer(seg.Text, seg.Voice, rate, botParams.VoiceStripPunct)
 		if err != nil {
 			log.Printf("[%s] Segment generation failed for %s: %v", botName, seg.Speaker, err)
 			sendVoiceAudio(bot, chatID, text, botName, botParams) // fallback to single voice
