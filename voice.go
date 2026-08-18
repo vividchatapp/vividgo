@@ -195,6 +195,8 @@ func voiceHintText(assignments map[string]string) string {
 
 // formatVoiceAssignments formats the character→voice assignments map as a
 // human-readable, sorted list suitable for display in a Telegram message.
+// Each entry is prefixed with a 1-based index so users can reference characters
+// in commands like "voice change [n] [accent]".
 // Returns a friendly message when there are no assignments yet.
 func formatVoiceAssignments(assignments map[string]string) string {
 	if len(assignments) == 0 {
@@ -208,8 +210,8 @@ func formatVoiceAssignments(assignments map[string]string) string {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	for _, name := range names {
-		fmt.Fprintf(&sb, "  %s: %s\n", name, assignments[name])
+	for i, name := range names {
+		fmt.Fprintf(&sb, "  %d) %s: %s\n", i+1, name, assignments[name])
 	}
 	return sb.String()
 }
@@ -234,6 +236,57 @@ func SyncVoiceAssignments(botParams *BotParams, assignments map[string]string) {
 		cloned[name] = voice
 	}
 	botParams.VoiceAssignments = cloned
+}
+
+// ChangeCharacterVoice asks the AI to select an appropriate voice for a character
+// based on an accent/description, then updates the character→voice assignment.
+// It returns a human-readable confirmation message describing the change.
+func ChangeCharacterVoice(botName string, botParams *BotParams, modelEntry ModelEntry, apiBase string, assignments *map[string]string, characterName string, accent string) (string, error) {
+	// Seed the assignments map if nil
+	if assignments == nil {
+		*assignments = make(map[string]string)
+	}
+
+	// Build the LLM prompt: use the voiceAssistant role as the system prompt,
+	// and ask the model to pick a voice for the character.
+	systemPrompt := loadRoleContent("voiceAssistant")
+
+	var userMsg strings.Builder
+	userMsg.WriteString("Select an appropriate voice for the character below.\n\n")
+	userMsg.WriteString(fmt.Sprintf("Character: %s\n", characterName))
+	userMsg.WriteString(fmt.Sprintf("Desired accent/description: %s\n\n", accent))
+	userMsg.WriteString("Respond ONLY with a valid JSON array containing a single object in this exact format:\n")
+	userMsg.WriteString(`[{"speaker": "Character Name", "voice": "SELECTED_VOICE", "text": "A short sample line spoken by this character."}]`)
+
+	// Call the LLM with NO conversation context
+	effectiveBase := getEffectiveAPIBase(modelEntry, apiBase)
+	scriptJSON, err := callOllamaAPI(effectiveBase, modelEntry, systemPrompt, nil, userMsg.String(), botParams.NumCtx, botParams.NoThink)
+	if err != nil {
+		return "", fmt.Errorf("voice selection LLM call failed: %w", err)
+	}
+
+	segments, err := parseVoiceSegments(scriptJSON)
+	if err != nil {
+		return "", fmt.Errorf("voice selection parse failed: %w", err)
+	}
+	if len(segments) == 0 {
+		return "", fmt.Errorf("AI returned no voice selection")
+	}
+
+	// Use the first segment's voice as the new assignment
+	newVoice := strings.TrimSpace(segments[0].Voice)
+	if newVoice == "" {
+		return "", fmt.Errorf("AI returned an empty voice")
+	}
+
+	// Update the assignment map
+	(*assignments)[characterName] = newVoice
+	SyncVoiceAssignments(botParams, *assignments)
+	if botParams != nil {
+		saveBotParams(botName, *botParams)
+	}
+
+	return fmt.Sprintf("Voice for '%s' changed to: %s", characterName, newVoice), nil
 }
 
 // sendVoiceCharacterAudio converts the latest story text into a multi-voice
@@ -309,6 +362,11 @@ func sendVoiceCharacterAudio(bot *tgbotapi.BotAPI, chatID int64, text string, bo
 	SyncVoiceAssignments(botParams, *assignments)
 	if botParams != nil {
 		saveBotParams(botName, *botParams)
+	}
+
+	// Debug: print the accent/voice chosen for each character
+	for i, seg := range segments {
+		log.Printf("[%s] Character %d accent chosen: %s -> %s", botName, i+1, seg.Speaker, seg.Voice)
 	}
 
 	// Clamp speed and build the rate string

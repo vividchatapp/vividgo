@@ -167,8 +167,9 @@ type GitHubContentEntry struct {
 }
 
 // downloadRolesFromGitHub fetches role files from the vivid-data GitHub repo
-// and saves them to the local roles/ directory if they don't already exist.
-func downloadRolesFromGitHub() {
+// and saves them to the local roles/ directory. If redownloadExisting is true,
+// the user is prompted for each file that already exists whether to redownload it.
+func downloadRolesFromGitHub(redownloadExisting bool) {
 	fmt.Println()
 	fmt.Printf("%s━━━ Downloading Roles from GitHub %s━━━%s\n", colorBold, colorGreen, colorReset)
 	fmt.Println()
@@ -212,6 +213,7 @@ func downloadRolesFromGitHub() {
 	}
 
 	downloaded := 0
+	overwritten := 0
 	skipped := 0
 
 	for _, entry := range entries {
@@ -223,10 +225,22 @@ func downloadRolesFromGitHub() {
 		localPath := fmt.Sprintf("roles/%s", entry.Name)
 
 		// Check if the file already exists locally
+		existed := false
 		if _, err := os.Stat(localPath); err == nil {
-			fmt.Printf("  %s• %s already exists (skipped)%s\n", colorDim, entry.Name, colorReset)
-			skipped++
-			continue
+			existed = true
+			if redownloadExisting {
+				redownloadPrompt := fmt.Sprintf("Role '%s' already exists. Redownload?", entry.Name)
+				if !confirmYesNo(redownloadPrompt, false) {
+					fmt.Printf("  %s• %s already exists (skipped)%s\n", colorDim, entry.Name, colorReset)
+					skipped++
+					continue
+				}
+				// User chose to redownload — fall through to download (overwrites the file)
+			} else {
+				fmt.Printf("  %s• %s already exists (skipped)%s\n", colorDim, entry.Name, colorReset)
+				skipped++
+				continue
+			}
 		}
 
 		// Download the raw file
@@ -251,11 +265,20 @@ func downloadRolesFromGitHub() {
 		}
 
 		fmt.Printf(" %s✓%s\n", colorGreen, colorReset)
-		downloaded++
+		if existed {
+			// File was overwritten (it existed before this download)
+			overwritten++
+		} else {
+			downloaded++
+		}
 	}
 
 	fmt.Println()
-	fmt.Printf("  %s✓ Downloaded %d new role(s), skipped %d existing%s\n", colorGreen, downloaded, skipped, colorReset)
+	if overwritten > 0 {
+		fmt.Printf("  %s✓ Downloaded %d new role(s), overwrote %d, skipped %d existing%s\n", colorGreen, downloaded, overwritten, skipped, colorReset)
+	} else {
+		fmt.Printf("  %s✓ Downloaded %d new role(s), skipped %d existing%s\n", colorGreen, downloaded, skipped, colorReset)
+	}
 }
 
 // runSetupWizard runs the interactive configuration setup.
@@ -748,9 +771,10 @@ func initializeSetup(existingCfg *Config) *Config {
 		return nil
 	}
 
-	// Ask if user wants to download roles from GitHub
+	// Ask if user wants to download roles from GitHub.
+	// In --init mode (existingCfg != nil), existing roles are offered for redownload.
 	if confirmYesNo("Download roles from GitHub?", false) {
-		downloadRolesFromGitHub()
+		downloadRolesFromGitHub(existingCfg != nil)
 	} else {
 		fmt.Printf("  %s• Skipped downloading roles from GitHub%s\n", colorDim, colorReset)
 	}

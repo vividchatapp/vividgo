@@ -1381,7 +1381,7 @@ func runBot(botCfg BotConfig, userID int64, ollamaCfg OllamaConfig, wg *sync.Wai
 	• voice speed [1-10] - Set voice speed (10% increments)
 	• voice char [on/off] - Multi-voice character narration
 	• voice list - Show character voice assignments
-	• voice list - Show character voice assignments
+	• voice change [n] [accent] - Change a character's voice (e.g. .voice change 2 deep southern accent)
 Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat, cl=clean, mf=modelsfiltered, sc=scene, hs=history, mo=mode, mc=llmctx`
 
 			case "provider", "p":
@@ -1604,6 +1604,10 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat,
 				// Sync the chat log file with the empty context (truncate)
 				chatLogPath := getChatLogPath(currentStory, botCfg.Name)
 				rewriteChatLog(chatLogPath, conversationContext, currentMode)
+				// Clear character voice assignments from memory and persist to YAML
+				voiceCharAssignments = make(map[string]string)
+				SyncVoiceAssignments(&botParams, voiceCharAssignments)
+				saveBotParams(botCfg.Name, botParams)
 				responseText = "Conversation context cleared."
 				sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
 				continue
@@ -1631,6 +1635,8 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat,
 				ledger.Clear()
 				conversationContext = nil
 				voiceCharAssignments = make(map[string]string)
+				SyncVoiceAssignments(&botParams, voiceCharAssignments)
+				saveBotParams(botCfg.Name, botParams)
 				responseText = "Full cleanup complete. All messages deleted and memory wiped."
 				sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
 				continue
@@ -1942,8 +1948,47 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat,
 					// .voice list - show character→voice assignments
 					SyncVoiceAssignments(&botParams, voiceCharAssignments)
 					responseText = GetVoiceAssignmentsDisplay(voiceCharAssignments)
+				} else if len(parts) >= 4 && strings.ToLower(parts[1]) == "change" {
+					// .voice change [n] [accent] - ask AI to pick a new voice for a character
+					// The index [n] refers to the numbered list shown by .voice list
+					SyncVoiceAssignments(&botParams, voiceCharAssignments)
+					if len(voiceCharAssignments) == 0 {
+						responseText = "No character voice assignments yet. Use .voice char on and generate a response first."
+					} else {
+						num, err := strconv.Atoi(parts[2])
+						if err != nil || num < 1 || num > len(voiceCharAssignments) {
+							responseText = fmt.Sprintf("Invalid character number. Please choose 1-%d.", len(voiceCharAssignments))
+						} else {
+							// Get the character name at the given index (sorted order matches .voice list)
+							var names []string
+							for name := range voiceCharAssignments {
+								names = append(names, name)
+							}
+							sort.Strings(names)
+							characterName := names[num-1]
+
+							// The accent is everything after "voice change [n]"
+							accent := strings.TrimSpace(strings.TrimPrefix(update.Message.Text, parts[0]+" "+parts[1]+" "+parts[2]))
+							if accent == "" {
+								responseText = "Usage: voice change [n] [accent] - e.g. .voice change 2 deep southern accent"
+							} else {
+								// Send typing indicator while the AI selects a voice
+								typingAction := tgbotapi.NewChatAction(update.Message.Chat.ID, tgbotapi.ChatTyping)
+								bot.Send(typingAction)
+
+								modelEntry := ollamaCfg.Models[selectedProvider]
+								changeMsg, err := ChangeCharacterVoice(botCfg.Name, &botParams, modelEntry, ollamaCfg.APIBase, &voiceCharAssignments, characterName, accent)
+								if err != nil {
+									log.Printf("[%s] Voice change failed: %v", botCfg.Name, err)
+									responseText = fmt.Sprintf("Failed to change voice for '%s': %v", characterName, err)
+								} else {
+									responseText = changeMsg
+								}
+							}
+						}
+					}
 				} else {
-					responseText = fmt.Sprintf("Voice is %s, speed %d, char mode %s\nUsage: voice on/off, voice speed 1-10, voice char on/off, voice list", onOff(botParams.Voice), botParams.VoiceSpeed, onOff(botParams.VoiceChar))
+					responseText = fmt.Sprintf("Voice is %s, speed %d, char mode %s\nUsage: voice on/off, voice speed 1-10, voice char on/off, voice list, voice change [n] [accent]", onOff(botParams.Voice), botParams.VoiceSpeed, onOff(botParams.VoiceChar))
 				}
 				sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
 				continue

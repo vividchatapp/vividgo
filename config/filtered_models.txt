@@ -1,8 +1,0 @@
-nemotron-3-nano:30b
-minimax-m2.5
-nemotron-3-super
-nemotron-3-ultra
-gpt-oss:120b
-minimax-m3
-gemma4:31b
-gpt-oss:20b

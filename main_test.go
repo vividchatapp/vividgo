@@ -20,6 +20,15 @@ func TestGetVoiceAssignmentsDisplay(t *testing.T) {
 	if !strings.Contains(got, "Ren") || !strings.Contains(got, "en-GB-SoniaNeural") {
 		t.Fatalf("voice assignment list did not include character and selected voice: %q", got)
 	}
+	// Verify indexed listing format (1-based index in front of each voice)
+	if !strings.Contains(got, "1)") || !strings.Contains(got, "2)") || !strings.Contains(got, "3)") {
+		t.Fatalf("voice assignment list did not include index numbers in front of each entry: %q", got)
+	}
+	// Verify sorted order: Dax, Ren, Sora
+	if strings.Index(got, "Dax") > strings.Index(got, "Ren") ||
+		strings.Index(got, "Ren") > strings.Index(got, "Sora") {
+		t.Fatalf("voice assignment list is not sorted alphabetically: %q", got)
+	}
 }
 
 func TestLoadBotParams(t *testing.T) {
