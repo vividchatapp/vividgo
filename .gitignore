@@ -1,5 +1,5 @@
 node_modules/
 build/
 *.log
-.env*
 config.yaml
+config/
