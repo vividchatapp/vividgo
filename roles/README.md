@@ -23,6 +23,7 @@ The bot supports two voice output modes controlled by the `.voice` command:
 *   **`.voice off`** — Disables voice output.
 *   **`.voice speed [1-10]`** — Sets the speech rate. Each increment adds +10% speed (e.g. `5` = +50%).
 *   **`.voice`** — Shows current voice status, speed, and whether character mode is active.
+*   TTS preserves punctuation in both standard and character voice modes. Set `voice_strip_punct: true` in a bot parameter file only to enable the legacy quoted-dialogue punctuation stripping behavior.
 
 #### Character Voice (multi-voice narration)
 *   **`.voice char on`** — Enables **character voice mode**. This also turns on standard voice automatically. In this mode, the bot:

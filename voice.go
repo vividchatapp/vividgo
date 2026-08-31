@@ -6,9 +6,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"os/exec"
 	"regexp"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/difyz9/edge-tts-go/pkg/communicate"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -113,13 +118,105 @@ func stripPausePunctuation(text string) string {
 	})
 }
 
-// GenerateVoiceBuffer converts text to MP3 bytes in memory without touching disk.
-// It streams audio chunks directly into a bytes.Buffer in RAM.
-// This is a universal, cross-platform method that works on all devices
-// (Windows, Linux, macOS, etc.) via Microsoft Edge's online TTS service.
-// If stripPunct is true, all punctuation is removed before TTS to avoid
-// TTS-induced pauses between words.
-func GenerateVoiceBuffer(text, voice, rate string, stripPunct bool) ([]byte, error) {
+func parseLocalTTSRate(rate string) int {
+	rate = strings.TrimSpace(rate)
+	if rate == "" {
+		return 0
+	}
+	if !strings.ContainsAny(rate, "+-0123456789%") {
+		return 0
+	}
+	if !strings.HasSuffix(rate, "%") {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSuffix(rate, "%"))
+	if err != nil {
+		return 0
+	}
+	return n / 10
+}
+
+func detectAudioExtension(data []byte) string {
+	if len(data) >= 12 && bytes.Equal(data[:4], []byte("RIFF")) && bytes.Equal(data[8:12], []byte("WAVE")) {
+		return ".wav"
+	}
+	if len(data) >= 3 && data[0] == 0x49 && data[1] == 0x44 && data[2] == 0x33 {
+		return ".mp3"
+	}
+	if len(data) >= 2 && data[0] == 0xFF && (data[1]&0xE0) == 0xE0 {
+		return ".mp3"
+	}
+	return ".mp3"
+}
+
+func generateWindowsLocalTTS(text, rate string) ([]byte, error) {
+	if runtime.GOOS != "windows" {
+		return nil, fmt.Errorf("local TTS is only supported on Windows")
+	}
+
+	cleaned := stripMarkdown(text)
+	if cleaned == "" {
+		cleaned = "..."
+	}
+
+	outputDir, err := os.MkdirTemp("", "vividgo-local-tts-")
+	if err != nil {
+		return nil, fmt.Errorf("create temp dir: %w", err)
+	}
+	defer os.RemoveAll(outputDir)
+
+	textPath := outputDir + "\\input.txt"
+	audioPath := outputDir + "\\output.wav"
+	scriptPath := outputDir + "\\synthesize.ps1"
+	if err := os.WriteFile(textPath, []byte(cleaned), 0600); err != nil {
+		return nil, fmt.Errorf("write temp text: %w", err)
+	}
+
+	localRate := parseLocalTTSRate(rate)
+	if localRate > 10 {
+		localRate = 10
+	} else if localRate < -10 {
+		localRate = -10
+	}
+
+	psScript := "$ErrorActionPreference = \"Stop\"\n" +
+		"Add-Type -AssemblyName System.Speech\n" +
+		"$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer\n" +
+		"$synth.Rate = [int]$args[2]\n" +
+		"$synth.SetOutputToWaveFile($args[1])\n" +
+		"$synth.Speak([System.IO.File]::ReadAllText($args[0]))\n" +
+		"$synth.Dispose()\n"
+	if err := os.WriteFile(scriptPath, []byte(psScript), 0600); err != nil {
+		return nil, fmt.Errorf("write powershell script: %w", err)
+	}
+
+	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-File", scriptPath, textPath, audioPath, strconv.Itoa(localRate))
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("powershell local TTS failed: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	wavBytes, err := os.ReadFile(audioPath)
+	if err != nil {
+		return nil, fmt.Errorf("read generated WAV: %w", err)
+	}
+	if len(wavBytes) == 0 {
+		return nil, fmt.Errorf("local TTS produced empty WAV output")
+	}
+	return wavBytes, nil
+}
+
+func localWindowsTTSEnabled() bool {
+	if runtime.GOOS != "windows" {
+		return false
+	}
+	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.Dispose(); 'ok'")
+	if err := cmd.Run(); err != nil {
+		return false
+	}
+	return true
+}
+
+func generateVoiceBufferWithBackend(text, voice, rate string, stripPunct bool) ([]byte, string, error) {
 	cleaned := stripMarkdown(text)
 	if stripPunct {
 		cleaned = stripPausePunctuation(cleaned)
@@ -127,6 +224,20 @@ func GenerateVoiceBuffer(text, voice, rate string, stripPunct bool) ([]byte, err
 	if cleaned == "" {
 		cleaned = "..."
 	}
+
+	if runtime.GOOS == "windows" && localWindowsTTSEnabled() {
+		start := time.Now()
+		localBytes, localErr := generateWindowsLocalTTS(cleaned, rate)
+		if localErr == nil {
+			duration := time.Since(start)
+			log.Printf("Audio generation: using local Windows SAPI TTS, output=%s, bytes=%d, duration=%s", detectAudioExtension(localBytes), len(localBytes), duration)
+			return localBytes, "local", nil
+		}
+		log.Printf("Audio generation: local Windows SAPI failed after %s, falling back to online Edge TTS: %v", time.Since(start), localErr)
+	}
+
+	start := time.Now()
+	log.Printf("Audio generation: using online Edge TTS, voice=%s, rate=%s", voice, rate)
 
 	comm, err := communicate.NewCommunicate(
 		cleaned,
@@ -139,30 +250,38 @@ func GenerateVoiceBuffer(text, voice, rate string, stripPunct bool) ([]byte, err
 		60,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("initialization error: %w", err)
+		return nil, "online", fmt.Errorf("initialization error: %w", err)
 	}
 
 	var buf bytes.Buffer
 	ctx := context.Background()
-
-	// Stream returns a chunk channel and an error channel
 	chunkChan, errChan := comm.Stream(ctx)
 
-	// Write audio chunks directly into the memory buffer
 	for chunk := range chunkChan {
 		if chunk.Type == "audio" {
 			if _, err := buf.Write(chunk.Data); err != nil {
-				return nil, fmt.Errorf("buffer write error: %w", err)
+				return nil, "online", fmt.Errorf("buffer write error: %w", err)
 			}
 		}
 	}
 
-	// Check for streaming errors
 	if err := <-errChan; err != nil {
-		return nil, fmt.Errorf("streaming error: %w", err)
+		return nil, "online", fmt.Errorf("streaming error: %w", err)
 	}
 
-	return buf.Bytes(), nil
+	onlineBytes := buf.Bytes()
+	duration := time.Since(start)
+	log.Printf("Audio generation: online Edge TTS completed, output=%s, bytes=%d, duration=%s", detectAudioExtension(onlineBytes), len(onlineBytes), duration)
+	return onlineBytes, "online", nil
+}
+
+// GenerateVoiceBuffer converts text to MP3 bytes in memory without touching disk.
+// It streams audio chunks directly into a bytes.Buffer in RAM.
+// If stripPunct is true, all punctuation is removed before TTS to avoid
+// TTS-induced pauses between words.
+func GenerateVoiceBuffer(text, voice, rate string, stripPunct bool) ([]byte, error) {
+	buf, _, err := generateVoiceBufferWithBackend(text, voice, rate, stripPunct)
+	return buf, err
 }
 
 // speakToBytes generates MP3 audio from the given text using
@@ -414,14 +533,17 @@ func sendVoiceCharacterAudio(bot *tgbotapi.BotAPI, chatID int64, text string, bo
 
 	// Generate MP3 for each segment and concatenate into one combined audio file
 	var combined bytes.Buffer
-	for _, seg := range segments {
-		segBytes, err := GenerateVoiceBuffer(seg.Text, seg.Voice, rate, botParams.VoiceStripPunct)
+	totalStart := time.Now()
+	for i, seg := range segments {
+		segmentStart := time.Now()
+		segBytes, backend, err := generateVoiceBufferWithBackend(seg.Text, seg.Voice, rate, botParams.VoiceStripPunct)
 		if err != nil {
-			log.Printf("[%s] Segment generation failed for %s: %v", botName, seg.Speaker, err)
+			log.Printf("[%s] Segment generation failed for %s after %s: %v", botName, seg.Speaker, time.Since(segmentStart), err)
 			sendVoiceAudio(bot, chatID, text, botName, botParams) // fallback to single voice
 			return
 		}
 		combined.Write(segBytes)
+		log.Printf("[%s] Character segment %d/%d (%s -> %s) generated via %s in %s, bytes=%d", botName, i+1, len(segments), seg.Speaker, seg.Voice, backend, time.Since(segmentStart), len(segBytes))
 	}
 
 	if combined.Len() == 0 {
@@ -429,10 +551,13 @@ func sendVoiceCharacterAudio(bot *tgbotapi.BotAPI, chatID int64, text string, bo
 		return
 	}
 
-	// Send the combined MP3 as one audio file via Telegram
+	combinedBytes := combined.Bytes()
+	fileExt := detectAudioExtension(combinedBytes)
+	log.Printf("[%s] Character voice generation complete: %d segments, total duration=%s, output=%s, bytes=%d", botName, len(segments), time.Since(totalStart), fileExt, len(combinedBytes))
+	// Send the combined audio file via Telegram using the correct extension for the actual audio format.
 	audio := tgbotapi.NewAudio(chatID, tgbotapi.FileBytes{
-		Name:  "voice_character.mp3",
-		Bytes: combined.Bytes(),
+		Name:  "voice_character" + fileExt,
+		Bytes: combinedBytes,
 	})
 	if sentMsg, err := bot.Send(audio); err != nil {
 		log.Printf("[%s] Failed to send character voice audio: %v", botName, err)

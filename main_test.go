@@ -108,6 +108,21 @@ func TestPruneTraceFiles(t *testing.T) {
 	}
 }
 
+func TestLocalTTSRateConversion(t *testing.T) {
+	if got := parseLocalTTSRate("+0%"); got != 0 {
+		t.Fatalf("expected 0 for +0%%, got %d", got)
+	}
+	if got := parseLocalTTSRate("+50%"); got != 5 {
+		t.Fatalf("expected 5 for +50%%, got %d", got)
+	}
+	if got := parseLocalTTSRate("-20%"); got != -2 {
+		t.Fatalf("expected -2 for -20%%, got %d", got)
+	}
+	if got := parseLocalTTSRate("invalid"); got != 0 {
+		t.Fatalf("expected 0 for invalid rate, got %d", got)
+	}
+}
+
 func TestLoadBotParams(t *testing.T) {
 	// Check if config dir exists
 	configExists := false

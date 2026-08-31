@@ -483,11 +483,10 @@ func loadBotParams(botName string, defaultModel string) BotParams {
 	if params.VoiceSpeed == 0 {
 		params.VoiceSpeed = 2
 	}
-	// Set default voice strip punctuation if not set (legacy params files).
-	// Defaults to true so the TTS pause fix works immediately; set
-	// voice_strip_punct: false in the YAML to disable it.
+	// Preserve punctuation by default; set voice_strip_punct: true to opt into
+	// the legacy behavior for quoted dialogue.
 	if !params.VoiceStripPunct && !strings.Contains(string(data), "voice_strip_punct") {
-		params.VoiceStripPunct = true
+		params.VoiceStripPunct = false
 	}
 
 	log.Printf("[%s] Loaded bot params from %s: provider=%d, model=%s, mode=%s, role=%s, story=%s, active_scenes=%v, active_characters=%v", botName, path, params.SelectedProvider, params.CurrentModel, params.CurrentMode, params.CurrentRole, params.CurrentStory, params.ActiveScenes, params.ActiveCharacters)
@@ -1274,9 +1273,10 @@ func sendVoiceAudio(bot *tgbotapi.BotAPI, chatID int64, text string, botName str
 		return
 	}
 
-	// Send the MP3 as an audio file via Telegram (in memory, no temp file)
+	fileExt := detectAudioExtension(audioBytes)
+	// Send the generated audio as a Telegram audio attachment using the actual codec, not a guessed MP3 extension.
 	audio := tgbotapi.NewAudio(chatID, tgbotapi.FileBytes{
-		Name:  "voice.mp3",
+		Name:  "voice" + fileExt,
 		Bytes: audioBytes,
 	})
 	if sentMsg, err := bot.Send(audio); err != nil {
