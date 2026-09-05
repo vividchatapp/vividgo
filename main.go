@@ -582,35 +582,110 @@ func appendToChatLog(path, role, content string) {
 	}
 }
 
-// rewriteChatLog truncates the chat log file and rewrites the entire conversation
+// rewriteChatLogFile truncates the chat log file and rewrites the entire conversation
 // history from the given context. Used on /del to sync file with trimmed memory.
-func rewriteChatLog(path string, context []ContextMessage, mode string) {
-	// Truncate the file by opening with O_TRUNC
+func rewriteChatLogFile(path string, context []ContextMessage, mode string) error {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
-		log.Printf("Failed to open chat log for rewrite %s: %v", path, err)
-		return
+		return fmt.Errorf("failed to open chat log for rewrite %s: %w", path, err)
 	}
 	defer f.Close()
 
-	// Rewrite all entries from the trimmed context
 	for _, msg := range context {
 		if mode == "chat" {
-			// Chat mode: write both user and assistant messages
 			block := fmt.Sprintf("%s -----------\n%s\n\n", msg.Role, msg.Content)
 			if _, err := f.WriteString(block); err != nil {
-				log.Printf("Failed to write to chat log %s: %v", path, err)
-				return
+				return fmt.Errorf("failed to write to chat log %s: %w", path, err)
 			}
 		} else if msg.Role == "assistant" {
-			// Story mode: write only assistant messages
 			block := fmt.Sprintf("assistant -----------\n%s\n\n", msg.Content)
 			if _, err := f.WriteString(block); err != nil {
-				log.Printf("Failed to write to chat log %s: %v", path, err)
-				return
+				return fmt.Errorf("failed to write to chat log %s: %w", path, err)
 			}
 		}
 	}
+	return nil
+}
+
+// rewriteChatLog truncates the chat log file and rewrites the entire conversation
+// history from the given context. Used on /del to sync file with trimmed memory.
+func rewriteChatLog(path string, context []ContextMessage, mode string) {
+	if err := rewriteChatLogFile(path, context, mode); err != nil {
+		log.Printf("%v", err)
+	}
+}
+
+func getStorySnapshotPath(storyName, botName, snapshotName string) string {
+	chatDir := fmt.Sprintf("stories/%s/chat", storyName)
+	if err := os.MkdirAll(chatDir, 0755); err != nil {
+		log.Printf("Failed to create chat directory %s: %v", chatDir, err)
+	}
+	name := strings.TrimSpace(snapshotName)
+	if name == "" {
+		name = "autosave"
+	}
+	safe := sanitizeFilename(name)
+	return fmt.Sprintf("%s/%s_story_%s.txt", chatDir, botName, safe)
+}
+
+func saveStorySnapshot(storyName, botName string, context []ContextMessage, mode string) error {
+	return rewriteChatLogFile(getStorySnapshotPath(storyName, botName, "autosave"), context, mode)
+}
+
+func loadStorySnapshot(storyName, botName, mode string) ([]ContextMessage, error) {
+	path := getStorySnapshotPath(storyName, botName, "autosave")
+	if _, err := os.Stat(path); err != nil {
+		return nil, err
+	}
+	return loadChatHistory(path), nil
+}
+
+func listStorySnapshots(storyName, botName string) ([]string, error) {
+	chatDir := fmt.Sprintf("stories/%s/chat", storyName)
+	entries, err := os.ReadDir(chatDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []string{}, nil
+		}
+		return nil, fmt.Errorf("failed to read story snapshots for %s: %w", storyName, err)
+	}
+
+	prefix := botName + "_story_"
+	suffix := ".txt"
+	var names []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if strings.HasPrefix(name, prefix) && strings.HasSuffix(name, suffix) {
+			trimmed := strings.TrimSuffix(name, suffix)
+			trimmed = strings.TrimPrefix(trimmed, prefix)
+			if trimmed != "" {
+				names = append(names, trimmed)
+			}
+		}
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+func loadThreadSnapshotByIndex(storyName, botName string, index int) ([]ContextMessage, error) {
+	snapshots, err := listStorySnapshots(storyName, botName)
+	if err != nil {
+		return nil, err
+	}
+	if len(snapshots) == 0 {
+		return nil, fmt.Errorf("no saved threads found in story %s", storyName)
+	}
+	if index < 1 || index > len(snapshots) {
+		return nil, fmt.Errorf("invalid thread number. choose 1-%d", len(snapshots))
+	}
+	path := getStorySnapshotPath(storyName, botName, snapshots[index-1])
+	if _, err := os.Stat(path); err != nil {
+		return nil, err
+	}
+	return loadChatHistory(path), nil
 }
 
 // loadChatHistory reads a chat history file and parses it into a slice of ContextMessage.
@@ -1456,9 +1531,12 @@ func runBot(botCfg BotConfig, userID int64, ollamaCfg OllamaConfig, wg *sync.Wai
 			switch command {
 			case "help", "h":
 				responseText = `🤖 i5 Assistant Help
-📚 Stories
+📚 Stories & Threads
 • story - List story folders
 • story [n] - Select story folder (clears scenes/chars)
+• thread - List saved threads in the current story
+• thread save [name] - Save the current chat as a named thread
+• thread load [n] - Load a saved thread by number
 
 👤 Characters
 • char - List characters in current story
@@ -2494,6 +2572,34 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat,
 					}
 					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
 					continue
+				} else if len(parts) >= 2 && parts[1] == "save" {
+					name := "autosave"
+					if len(parts) >= 3 {
+						name = parts[2]
+					}
+					path := getStorySnapshotPath(currentStory, botCfg.Name, name)
+					if err := rewriteChatLogFile(path, conversationContext, currentMode); err != nil {
+						responseText = fmt.Sprintf("Failed to save story snapshot: %v", err)
+					} else {
+						responseText = fmt.Sprintf("Saved story snapshot '%s' for %s.", name, displayName(currentStory))
+					}
+					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
+					continue
+				} else if len(parts) >= 2 && parts[1] == "load" {
+					name := "autosave"
+					if len(parts) >= 3 {
+						name = parts[2]
+					}
+					path := getStorySnapshotPath(currentStory, botCfg.Name, name)
+					if _, err := os.Stat(path); err != nil {
+						responseText = fmt.Sprintf("No saved story snapshot named '%s' in %s.", name, displayName(currentStory))
+					} else {
+						loaded := loadChatHistory(path)
+						conversationContext = loaded
+						responseText = fmt.Sprintf("Loaded story snapshot '%s' for %s.", name, displayName(currentStory))
+					}
+					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
+					continue
 				} else if len(parts) == 2 {
 					// story [n] - select a story by number
 					num, err := strconv.Atoi(parts[1])
@@ -2520,8 +2626,89 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat,
 					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
 					continue
 				} else {
-					responseText = "Usage: story [n] - list or select a story"
+					responseText = "Usage: story [n] | story save [name] | story load [name]"
 				}
+
+			case "thread":
+				if len(parts) == 1 {
+					threads, err := listStorySnapshots(currentStory, botCfg.Name)
+					if err != nil {
+						responseText = fmt.Sprintf("Error listing story threads: %v", err)
+					} else if len(threads) == 0 {
+						responseText = fmt.Sprintf("No saved threads in %s yet.", displayName(currentStory))
+					} else {
+						var sb strings.Builder
+						sb.WriteString(fmt.Sprintf("Saved threads in '%s':\n", displayName(currentStory)))
+						for i, name := range threads {
+							sb.WriteString(fmt.Sprintf("  %d) %s\n", i+1, displayName(name)))
+						}
+						responseText = sb.String()
+					}
+					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
+					continue
+				}
+				if len(parts) >= 2 && parts[1] == "save" {
+					name := "autosave"
+					if len(parts) >= 3 {
+						name = parts[2]
+					}
+					path := getStorySnapshotPath(currentStory, botCfg.Name, name)
+					if err := rewriteChatLogFile(path, conversationContext, currentMode); err != nil {
+						responseText = fmt.Sprintf("Failed to save thread '%s': %v", name, err)
+					} else {
+						responseText = fmt.Sprintf("Saved thread '%s' in %s.", name, displayName(currentStory))
+					}
+					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
+					continue
+				}
+				if len(parts) >= 2 && parts[1] == "load" {
+					if len(parts) == 3 {
+						if num, err := strconv.Atoi(parts[2]); err == nil {
+							loaded, err := loadThreadSnapshotByIndex(currentStory, botCfg.Name, num)
+							if err != nil {
+								responseText = err.Error()
+							} else {
+								conversationContext = loaded
+								responseText = fmt.Sprintf("Loaded thread #%d from %s.", num, displayName(currentStory))
+							}
+							sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
+							continue
+						}
+					}
+					name := "autosave"
+					if len(parts) >= 3 {
+						name = parts[2]
+					}
+					path := getStorySnapshotPath(currentStory, botCfg.Name, name)
+					if _, err := os.Stat(path); err != nil {
+						responseText = fmt.Sprintf("No saved thread named '%s' in %s.", name, displayName(currentStory))
+					} else {
+						loaded := loadChatHistory(path)
+						conversationContext = loaded
+						responseText = fmt.Sprintf("Loaded thread '%s' from %s.", name, displayName(currentStory))
+					}
+					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
+					continue
+				}
+				if len(parts) == 2 {
+					num, err := strconv.Atoi(parts[1])
+					if err != nil {
+						responseText = "Usage: thread [list] | thread save [name] | thread load [number|name]"
+					} else {
+						loaded, err := loadThreadSnapshotByIndex(currentStory, botCfg.Name, num)
+						if err != nil {
+							responseText = err.Error()
+						} else {
+							conversationContext = loaded
+							responseText = fmt.Sprintf("Loaded thread #%d from %s.", num, displayName(currentStory))
+						}
+					}
+					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
+					continue
+				}
+				responseText = "Usage: thread | thread save [name] | thread load [number|name]"
+				sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
+				continue
 
 			case "scene", "sc":
 				if len(parts) == 1 {

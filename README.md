@@ -6,6 +6,8 @@
 
 Pre-built binaries are available for Windows, Linux, macOS, and FreeBSD. **Download the executable for your operating system here: [executables/readme.md](executables/readme.md)**
 
+For background-launch examples and Unix/Linux/macOS launcher scripts, see the executable guide: [executables/readme.md](executables/readme.md)
+
 ## ✨ Features
 
 ### Multi-Bot Support

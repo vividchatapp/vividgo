@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -120,6 +121,82 @@ func TestLocalTTSRateConversion(t *testing.T) {
 	}
 	if got := parseLocalTTSRate("invalid"); got != 0 {
 		t.Fatalf("expected 0 for invalid rate, got %d", got)
+	}
+}
+
+func TestSaveAndLoadStorySnapshot(t *testing.T) {
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get working dir: %v", err)
+	}
+	tmpDir := t.TempDir()
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("failed to chdir to temp dir: %v", err)
+	}
+	defer func() {
+		_ = os.Chdir(oldWD)
+	}()
+
+	context := []ContextMessage{
+		{Role: "user", Content: "Tell me a story."},
+		{Role: "assistant", Content: "Once upon a time..."},
+	}
+	storyOnly := []ContextMessage{{Role: "assistant", Content: "Once upon a time..."}}
+
+	if err := saveStorySnapshot("midnight_run", "bot1", context, "story"); err != nil {
+		t.Fatalf("saveStorySnapshot returned error: %v", err)
+	}
+
+	loaded, err := loadStorySnapshot("midnight_run", "bot1", "story")
+	if err != nil {
+		t.Fatalf("loadStorySnapshot returned error: %v", err)
+	}
+	if !reflect.DeepEqual(storyOnly, loaded) {
+		t.Fatalf("loaded snapshot mismatch\nwant: %#v\ngot:  %#v", storyOnly, loaded)
+	}
+
+	if _, err := os.Stat(filepath.Join("stories", "midnight_run", "chat", "bot1_story_autosave.txt")); err != nil {
+		t.Fatalf("expected saved story snapshot to exist: %v", err)
+	}
+}
+
+func TestThreadSnapshotListAndLoad(t *testing.T) {
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get working dir: %v", err)
+	}
+	tmpDir := t.TempDir()
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("failed to chdir to temp dir: %v", err)
+	}
+	defer func() {
+		_ = os.Chdir(oldWD)
+	}()
+
+	contextA := []ContextMessage{{Role: "assistant", Content: "chapter one"}}
+	contextB := []ContextMessage{{Role: "assistant", Content: "chapter two"}}
+
+	if err := rewriteChatLogFile(getStorySnapshotPath("my_story", "bot1", "chapter_one"), contextA, "story"); err != nil {
+		t.Fatalf("save chapter one snapshot returned error: %v", err)
+	}
+	if err := rewriteChatLogFile(getStorySnapshotPath("my_story", "bot1", "chapter_two"), contextB, "story"); err != nil {
+		t.Fatalf("save chapter two snapshot returned error: %v", err)
+	}
+
+	threads, err := listStorySnapshots("my_story", "bot1")
+	if err != nil {
+		t.Fatalf("listStorySnapshots returned error: %v", err)
+	}
+	if len(threads) < 2 {
+		t.Fatalf("expected at least 2 thread snapshots, got %d: %#v", len(threads), threads)
+	}
+
+	loaded, err := loadThreadSnapshotByIndex("my_story", "bot1", 2)
+	if err != nil {
+		t.Fatalf("loadThreadSnapshotByIndex returned error: %v", err)
+	}
+	if len(loaded) != 1 || loaded[0].Content != "chapter two" {
+		t.Fatalf("thread load by index returned unexpected content: %#v", loaded)
 	}
 }
 

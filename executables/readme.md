@@ -2,6 +2,33 @@
 
 Pre-built binaries for VividGo are available below. Download the executable that matches your operating system and architecture, then follow the platform-specific instructions.
 
+For quick access from the project root, see the main project [README.md](../README.md) and the executable download guide here.
+
+---
+
+## Background launcher scripts for Unix / Linux / macOS
+
+For Unix-like systems, each release folder also includes a small launcher script that runs the bot in the background and keeps it alive after the terminal closes.
+
+- [linux_x64/vivid.sh](linux_x64/vivid.sh)
+- [linux_x86/vivid.sh](linux_x86/vivid.sh)
+- [linux_arm64/vivid.sh](linux_arm64/vivid.sh)
+- [linux_arm_pi2/vivid.sh](linux_arm_pi2/vivid.sh)
+- [linux_arm_pi3_32/vivid.sh](linux_arm_pi3_32/vivid.sh)
+- [linux_arm_pi_zero_w/vivid.sh](linux_arm_pi_zero_w/vivid.sh)
+- [freebsd_x64/vivid.sh](freebsd_x64/vivid.sh)
+- [mac_x64/vivid.sh](mac_x64/vivid.sh)
+- [mac_arm64/vivid.sh](mac_arm64/vivid.sh)
+
+Use them like this:
+
+```bash
+chmod +x vivid.sh
+./vivid.sh
+```
+
+These scripts intentionally use `nohup` so the bot keeps running in the background and logs to `vividgo.log` in the same folder.
+
 ---
 
 ## Windows
