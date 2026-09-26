@@ -120,13 +120,36 @@ type OllamaLocalTagsResponse struct {
 	Models []OllamaLocalModel `json:"models"`
 }
 
-// fetchLocalModels calls {apiBase}/api/tags to list models from a local Ollama instance.
+// fetchLocalModels lists models from any provider base URL.
+// It tries native Ollama ({base}/api/tags) first, then the OpenAI-compatible
+// endpoint ({base}/v1/models) used by llama.cpp server. A trailing /v1 is stripped
+// before probing so both "http://host:8080" and "http://host:8080/v1" work.
 // Returns a sorted list of model names, or an error if the request fails.
 func fetchLocalModels(apiBase string) ([]string, error) {
 	baseURL := strings.TrimRight(apiBase, "/")
-	endpoint := baseURL + "/api/tags"
+	baseURL = strings.TrimSuffix(baseURL, "/v1")
 
 	client := &http.Client{Timeout: 10 * time.Second}
+
+	// 1. Native Ollama
+	if resp, err := client.Get(baseURL + "/api/tags"); err == nil {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			var tagsResp OllamaLocalTagsResponse
+			if err := json.Unmarshal(body, &tagsResp); err == nil && len(tagsResp.Models) > 0 {
+				var modelNames []string
+				for _, m := range tagsResp.Models {
+					modelNames = append(modelNames, m.Name)
+				}
+				sort.Strings(modelNames)
+				return modelNames, nil
+			}
+		}
+	}
+
+	// 2. llama.cpp / OpenAI-compatible
+	endpoint := baseURL + "/v1/models"
 	resp, err := client.Get(endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to %s: %w", endpoint, err)
@@ -142,18 +165,24 @@ func fetchLocalModels(apiBase string) ([]string, error) {
 		return nil, fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
 	}
 
-	var tagsResp OllamaLocalTagsResponse
-	if err := json.Unmarshal(body, &tagsResp); err != nil {
+	var openAIResp struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &openAIResp); err != nil {
 		return nil, fmt.Errorf("failed to parse models: %w", err)
 	}
 
-	if len(tagsResp.Models) == 0 {
+	if len(openAIResp.Data) == 0 {
 		return nil, fmt.Errorf("no models found at %s", apiBase)
 	}
 
 	var modelNames []string
-	for _, m := range tagsResp.Models {
-		modelNames = append(modelNames, m.Name)
+	for _, m := range openAIResp.Data {
+		if m.ID != "" {
+			modelNames = append(modelNames, m.ID)
+		}
 	}
 	sort.Strings(modelNames)
 	return modelNames, nil
@@ -291,19 +320,21 @@ func runSetupWizard(existingCfg *Config) *Config {
 	var defaultBots []BotConfig
 	var defaultUserID int64
 	var defaultDebug bool
-	var defaultAPIBase string
 	var defaultModels []ModelEntry
 
 	if existingCfg != nil {
 		defaultBots = existingCfg.Bots
 		defaultUserID = existingCfg.UserID
 		defaultDebug = existingCfg.Debug
-		defaultAPIBase = existingCfg.Ollama.APIBase
 		defaultModels = existingCfg.Ollama.Models
-	}
-
-	if defaultAPIBase == "" {
-		defaultAPIBase = "https://api.ollama.com"
+		// Migrate legacy global api_base into per-model values for --init defaults.
+		if strings.TrimSpace(existingCfg.Ollama.APIBase) != "" {
+			for i := range defaultModels {
+				if strings.TrimSpace(defaultModels[i].APIBase) == "" {
+					defaultModels[i].APIBase = existingCfg.Ollama.APIBase
+				}
+			}
+		}
 	}
 
 	totalSteps := 5
@@ -405,17 +436,11 @@ func runSetupWizard(existingCfg *Config) *Config {
 		fmt.Printf("  %sDebug mode disabled%s\n", colorDim, colorReset)
 	}
 
-	// ── Step 4: Ollama API Base URL ──
-	printSection("Ollama API Configuration")
-	printStep(4, totalSteps, "Ollama API Base URL")
+	// ── Step 4: Providers (each with its own API base URL) ──
+	printSection("Provider Configuration")
+	printStep(4, totalSteps, "Providers (per-provider API base URL)")
 
-	apiBase := readLine("Ollama API Base URL", defaultAPIBase)
-	if apiBase == "" {
-		apiBase = "https://api.ollama.com"
-	}
-	fmt.Printf("  %s✓ API Base: %s%s\n", colorGreen, apiBase, colorReset)
-
-	// ── Step 5: Ollama API Keys (loop) ──
+	// ── Step 5: Provider API Keys (loop) ──
 	printStep(5, totalSteps, "Ollama API Keys")
 
 	fmt.Printf("  %sGet your API key from https://ollama.com/settings/keys%s\n", colorDim, colorReset)
@@ -470,7 +495,7 @@ func runSetupWizard(existingCfg *Config) *Config {
 			defaultProviderAPIBase = defaultModels[providerIndex-1].APIBase
 		}
 		if defaultProviderAPIBase == "" {
-			defaultProviderAPIBase = apiBase
+			defaultProviderAPIBase = "https://api.ollama.com"
 		}
 
 		apiBasePrompt := fmt.Sprintf("API Base URL for '%s'", providerName)
@@ -554,8 +579,7 @@ func runSetupWizard(existingCfg *Config) *Config {
 		UserID: userID,
 		Debug:  debug,
 		Ollama: OllamaConfig{
-			APIBase: apiBase,
-			Models:  models,
+			Models: models,
 		},
 	}
 
@@ -581,18 +605,20 @@ func writeConfigFile(cfg *Config) error {
 	sb.WriteString(fmt.Sprintf("user_id: %d\n", cfg.UserID))
 	sb.WriteString(fmt.Sprintf("debug: %t\n", cfg.Debug))
 	sb.WriteString("\n")
-	sb.WriteString("# Ollama API Configuration\n")
-	sb.WriteString("# Used to talk to ollama.com for online models\n")
+	sb.WriteString("# Provider Configuration\n")
+	sb.WriteString("# Each provider has its own api_base so different backends can be mixed\n")
+	sb.WriteString("# (ollama.com, local Ollama, llama.cpp server with .../v1 base, ...)\n")
 	sb.WriteString("ollama:\n")
-	sb.WriteString(fmt.Sprintf("  api_base: %q  # ollama.com API endpoint\n", cfg.Ollama.APIBase))
 	sb.WriteString("  models:\n")
 	for _, model := range cfg.Ollama.Models {
-		sb.WriteString(fmt.Sprintf("    - name: %q\n", model.Name))
-		sb.WriteString(fmt.Sprintf("      api_key: %q  # Your ollama.com API key\n", model.APIKey))
-		sb.WriteString(fmt.Sprintf("      model: %q  # Model to use (e.g., llama3.2, mistral, etc.)\n", model.Model))
-		if model.APIBase != "" {
-			sb.WriteString(fmt.Sprintf("      api_base: %q  # API base URL for this model\n", model.APIBase))
+		apiBase := model.APIBase
+		if apiBase == "" {
+			apiBase = "https://api.ollama.com"
 		}
+		sb.WriteString(fmt.Sprintf("    - name: %q\n", model.Name))
+		sb.WriteString(fmt.Sprintf("      api_key: %q\n", model.APIKey))
+		sb.WriteString(fmt.Sprintf("      model: %q  # Model to use (e.g., llama3.2, mistral, etc.)\n", model.Model))
+		sb.WriteString(fmt.Sprintf("      api_base: %q  # API base URL for this provider\n", apiBase))
 	}
 
 	data := []byte(sb.String())
@@ -705,13 +731,9 @@ func printSummary(cfg *Config) {
 		fmt.Printf("    - %s: %s\n", bot.Name, maskKey(bot.Token))
 	}
 	fmt.Printf("  %sDebug:%s %t\n", colorYellow, colorReset, cfg.Debug)
-	fmt.Printf("  %sOllama API Base:%s %s\n", colorYellow, colorReset, cfg.Ollama.APIBase)
 	fmt.Printf("  %sProviders:%s\n", colorYellow, colorReset)
 	for _, model := range cfg.Ollama.Models {
-		apiBaseDisplay := model.APIBase
-		if apiBaseDisplay == "" {
-			apiBaseDisplay = cfg.Ollama.APIBase
-		}
+		apiBaseDisplay := getEffectiveAPIBase(model, cfg.Ollama.APIBase)
 		fmt.Printf("    - %s: %s (api_base: %s, key: %s)\n", model.Name, model.Model, apiBaseDisplay, maskKey(model.APIKey))
 	}
 	fmt.Println()

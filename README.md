@@ -37,10 +37,12 @@ For background-launch examples and Unix/Linux/macOS launcher scripts, see the ex
 
 ### Voice Output
 - Speak AI responses as MP3 audio via Microsoft Edge's online TTS service
+- Always uses Edge neural voices (e.g. `en-GB-SoniaNeural`) — there is no local/offline OS voice fallback, so speech always sounds like the configured Edge voice (requires internet access)
 - In-memory generation — no temporary files written to disk
 - Toggle per bot with `.voice [on/off]` - Speak AI responses as audio
 - `.voice speed [1-10]` - Set voice speed (10% increments)
 - `.voice char [on/off]` - Multi-voice character narration
+- `.voice punct [on/off]` - Keep (`on`, default) or strip (`off`) punctuation in spoken audio. `off` removes punctuation from quoted dialogue, which makes Edge TTS read without pauses (legacy run-on mode)
 
 ### Conversation Management
 - Persistent chat history saved to disk (`stories/<story>/chat/<bot>_chat_history.txt`)
@@ -106,11 +108,15 @@ Configuration is stored in `config.yaml`. You can also configure via environment
 
 All commands start with a dot (`.`) or can be used without it. Type `.help` in Telegram for the full list.
 
-### Stories & Characters
+### Stories & Chapters
 | Command | Description |
 |---------|-------------|
 | `.story` | List story folders |
 | `.story [n]` | Select story folder (clears scenes/chars) |
+| `.chapter` / `.ch` | List saved chapters in current story |
+| `.chapter [n]` / `.ch [n]` | Pick/load listed chapter by number |
+| `.chapter save [name]` / `.ch save [name]` | Save current conversation as a chapter |
+| `.chapter load [number|name]` / `.ch load [number|name]` | Load a saved chapter |
 | `.char` | List characters in current story |
 | `.char 1 -2 3` | Multi-toggle characters (prefix `-` to deactivate) |
 | `.char all off` | Deactivate all characters |
@@ -169,8 +175,9 @@ All commands start with a dot (`.`) or can be used without it. Type `.help` in T
 | `.voice [on/off]` | Speak AI responses as audio |
 | `.voice speed [1-10]` | Set voice speed (10% increments) |
 | `.voice char [on/off]` | Multi-voice character narration |
+| `.voice punct [on/off]` | Keep (on, default) or strip (off) punctuation in spoken audio |
 
-**Synonyms:** `r`=role, `rs`=rolesummary, `p`=provider, `m`=model, `s`=status, `h`=help, `c`=chat, `cl`=clean, `mf`=modelsfiltered, `sc`=scene, `hs`=history, `mo`=mode, `mc`=llmctx
+**Synonyms:** `r`=role, `rs`=rolesummary, `p`=provider, `m`=model, `s`=status, `h`=help, `ch`=chapter, `c`=chat, `cl`=clean, `mf`=modelsfiltered, `sc`=scene, `hs`=history, `mo`=mode, `mc`=llmctx
 
 ## 📁 Project Structure
 

@@ -6,12 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"os"
-	"os/exec"
 	"regexp"
-	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -118,24 +114,10 @@ func stripPausePunctuation(text string) string {
 	})
 }
 
-func parseLocalTTSRate(rate string) int {
-	rate = strings.TrimSpace(rate)
-	if rate == "" {
-		return 0
-	}
-	if !strings.ContainsAny(rate, "+-0123456789%") {
-		return 0
-	}
-	if !strings.HasSuffix(rate, "%") {
-		return 0
-	}
-	n, err := strconv.Atoi(strings.TrimSuffix(rate, "%"))
-	if err != nil {
-		return 0
-	}
-	return n / 10
-}
-
+// detectAudioExtension inspects the leading bytes of generated audio and returns
+// the file extension matching the actual codec. Microsoft Edge's online TTS
+// returns MP3, but the check keeps the attachment extension honest if that
+// ever changes.
 func detectAudioExtension(data []byte) string {
 	if len(data) >= 12 && bytes.Equal(data[:4], []byte("RIFF")) && bytes.Equal(data[8:12], []byte("WAVE")) {
 		return ".wav"
@@ -149,74 +131,14 @@ func detectAudioExtension(data []byte) string {
 	return ".mp3"
 }
 
-func generateWindowsLocalTTS(text, rate string) ([]byte, error) {
-	if runtime.GOOS != "windows" {
-		return nil, fmt.Errorf("local TTS is only supported on Windows")
-	}
-
-	cleaned := stripMarkdown(text)
-	if cleaned == "" {
-		cleaned = "..."
-	}
-
-	outputDir, err := os.MkdirTemp("", "vividgo-local-tts-")
-	if err != nil {
-		return nil, fmt.Errorf("create temp dir: %w", err)
-	}
-	defer os.RemoveAll(outputDir)
-
-	textPath := outputDir + "\\input.txt"
-	audioPath := outputDir + "\\output.wav"
-	scriptPath := outputDir + "\\synthesize.ps1"
-	if err := os.WriteFile(textPath, []byte(cleaned), 0600); err != nil {
-		return nil, fmt.Errorf("write temp text: %w", err)
-	}
-
-	localRate := parseLocalTTSRate(rate)
-	if localRate > 10 {
-		localRate = 10
-	} else if localRate < -10 {
-		localRate = -10
-	}
-
-	psScript := "$ErrorActionPreference = \"Stop\"\n" +
-		"Add-Type -AssemblyName System.Speech\n" +
-		"$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer\n" +
-		"$synth.Rate = [int]$args[2]\n" +
-		"$synth.SetOutputToWaveFile($args[1])\n" +
-		"$synth.Speak([System.IO.File]::ReadAllText($args[0]))\n" +
-		"$synth.Dispose()\n"
-	if err := os.WriteFile(scriptPath, []byte(psScript), 0600); err != nil {
-		return nil, fmt.Errorf("write powershell script: %w", err)
-	}
-
-	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-File", scriptPath, textPath, audioPath, strconv.Itoa(localRate))
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("powershell local TTS failed: %w: %s", err, strings.TrimSpace(string(output)))
-	}
-	wavBytes, err := os.ReadFile(audioPath)
-	if err != nil {
-		return nil, fmt.Errorf("read generated WAV: %w", err)
-	}
-	if len(wavBytes) == 0 {
-		return nil, fmt.Errorf("local TTS produced empty WAV output")
-	}
-	return wavBytes, nil
-}
-
-func localWindowsTTSEnabled() bool {
-	if runtime.GOOS != "windows" {
-		return false
-	}
-	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.Dispose(); 'ok'")
-	if err := cmd.Run(); err != nil {
-		return false
-	}
-	return true
-}
-
-func generateVoiceBufferWithBackend(text, voice, rate string, stripPunct bool) ([]byte, string, error) {
+// GenerateVoiceBuffer converts text to MP3 bytes in memory without touching disk.
+// Microsoft Edge's online TTS service (edge-tts-go) is the only backend, so the
+// Edge neural voice passed in is always honoured and the output is never a local
+// operating-system voice. Audio chunks are streamed directly into a bytes.Buffer
+// in RAM. No temporary files are written to disk.
+// If stripPunct is true, punctuation inside quoted dialogue is removed before TTS
+// to avoid TTS-induced pauses between words.
+func GenerateVoiceBuffer(text, voice, rate string, stripPunct bool) ([]byte, error) {
 	cleaned := stripMarkdown(text)
 	if stripPunct {
 		cleaned = stripPausePunctuation(cleaned)
@@ -224,16 +146,8 @@ func generateVoiceBufferWithBackend(text, voice, rate string, stripPunct bool) (
 	if cleaned == "" {
 		cleaned = "..."
 	}
-
-	if runtime.GOOS == "windows" && localWindowsTTSEnabled() {
-		start := time.Now()
-		localBytes, localErr := generateWindowsLocalTTS(cleaned, rate)
-		if localErr == nil {
-			duration := time.Since(start)
-			log.Printf("Audio generation: using local Windows SAPI TTS, output=%s, bytes=%d, duration=%s", detectAudioExtension(localBytes), len(localBytes), duration)
-			return localBytes, "local", nil
-		}
-		log.Printf("Audio generation: local Windows SAPI failed after %s, falling back to online Edge TTS: %v", time.Since(start), localErr)
+	if strings.TrimSpace(voice) == "" {
+		voice = defaultVoice
 	}
 
 	start := time.Now()
@@ -250,7 +164,7 @@ func generateVoiceBufferWithBackend(text, voice, rate string, stripPunct bool) (
 		60,
 	)
 	if err != nil {
-		return nil, "online", fmt.Errorf("initialization error: %w", err)
+		return nil, fmt.Errorf("initialization error: %w", err)
 	}
 
 	var buf bytes.Buffer
@@ -260,33 +174,23 @@ func generateVoiceBufferWithBackend(text, voice, rate string, stripPunct bool) (
 	for chunk := range chunkChan {
 		if chunk.Type == "audio" {
 			if _, err := buf.Write(chunk.Data); err != nil {
-				return nil, "online", fmt.Errorf("buffer write error: %w", err)
+				return nil, fmt.Errorf("buffer write error: %w", err)
 			}
 		}
 	}
 
 	if err := <-errChan; err != nil {
-		return nil, "online", fmt.Errorf("streaming error: %w", err)
+		return nil, fmt.Errorf("streaming error: %w", err)
 	}
 
-	onlineBytes := buf.Bytes()
-	duration := time.Since(start)
-	log.Printf("Audio generation: online Edge TTS completed, output=%s, bytes=%d, duration=%s", detectAudioExtension(onlineBytes), len(onlineBytes), duration)
-	return onlineBytes, "online", nil
+	audioBytes := buf.Bytes()
+	log.Printf("Audio generation: online Edge TTS completed, output=%s, bytes=%d, duration=%s", detectAudioExtension(audioBytes), len(audioBytes), time.Since(start))
+	return audioBytes, nil
 }
 
-// GenerateVoiceBuffer converts text to MP3 bytes in memory without touching disk.
-// It streams audio chunks directly into a bytes.Buffer in RAM.
-// If stripPunct is true, all punctuation is removed before TTS to avoid
-// TTS-induced pauses between words.
-func GenerateVoiceBuffer(text, voice, rate string, stripPunct bool) ([]byte, error) {
-	buf, _, err := generateVoiceBufferWithBackend(text, voice, rate, stripPunct)
-	return buf, err
-}
-
-// speakToBytes generates MP3 audio from the given text using
-// Microsoft Edge's online TTS service, returning the audio in memory.
-// No temporary files are written to disk.
+// speakToBytes generates audio from the given text using Microsoft Edge's online
+// TTS service with the default voice (defaultVoice), returning the audio in
+// memory. No temporary files are written to disk.
 // speed is 1-10, where each increment adds +10% to the speech rate.
 // If stripPunct is true, all punctuation is removed before TTS to avoid
 // TTS-induced pauses between words.
@@ -410,7 +314,7 @@ func ChangeCharacterVoice(botName string, botParams *BotParams, modelEntry Model
 	userMsg.WriteString("Respond ONLY with a valid JSON array containing a single object in this exact format:\n")
 	userMsg.WriteString(`[{"speaker": "Character Name", "voice": "SELECTED_VOICE", "text": "A short sample line spoken by this character."}]`)
 
-	// Call the LLM with NO conversation context
+	// Call the LLM with NO conversation context (per-model api_base).
 	effectiveBase := getEffectiveAPIBase(modelEntry, apiBase)
 	scriptJSON, err := callOllamaAPI(botName, effectiveBase, modelEntry, systemPrompt, nil, userMsg.String(), botParams.NumCtx, botParams.NoThink)
 	if err != nil {
@@ -474,8 +378,8 @@ func sendVoiceCharacterAudio(bot *tgbotapi.BotAPI, chatID int64, text string, bo
 	}
 	userMsg.WriteString(text)
 
-	// Call the LLM with NO conversation context (only the current response text)
-	// Use the effective API base (per-model override or global default).
+	// Call the LLM with NO conversation context (only the current response text).
+	// Effective base is the per-model api_base.
 	effectiveBase := getEffectiveAPIBase(modelEntry, apiBase)
 	scriptJSON, err := callOllamaAPI(botName, effectiveBase, modelEntry, systemPrompt, nil, userMsg.String(), botParams.NumCtx, botParams.NoThink)
 	if err != nil {
@@ -536,14 +440,14 @@ func sendVoiceCharacterAudio(bot *tgbotapi.BotAPI, chatID int64, text string, bo
 	totalStart := time.Now()
 	for i, seg := range segments {
 		segmentStart := time.Now()
-		segBytes, backend, err := generateVoiceBufferWithBackend(seg.Text, seg.Voice, rate, botParams.VoiceStripPunct)
+		segBytes, err := GenerateVoiceBuffer(seg.Text, seg.Voice, rate, botParams.VoiceStripPunct)
 		if err != nil {
 			log.Printf("[%s] Segment generation failed for %s after %s: %v", botName, seg.Speaker, time.Since(segmentStart), err)
 			sendVoiceAudio(bot, chatID, text, botName, botParams) // fallback to single voice
 			return
 		}
 		combined.Write(segBytes)
-		log.Printf("[%s] Character segment %d/%d (%s -> %s) generated via %s in %s, bytes=%d", botName, i+1, len(segments), seg.Speaker, seg.Voice, backend, time.Since(segmentStart), len(segBytes))
+		log.Printf("[%s] Character segment %d/%d (%s -> %s) generated via edge-tts in %s, bytes=%d", botName, i+1, len(segments), seg.Speaker, seg.Voice, time.Since(segmentStart), len(segBytes))
 	}
 
 	if combined.Len() == 0 {

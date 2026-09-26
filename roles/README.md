@@ -23,7 +23,8 @@ The bot supports two voice output modes controlled by the `.voice` command:
 *   **`.voice off`** — Disables voice output.
 *   **`.voice speed [1-10]`** — Sets the speech rate. Each increment adds +10% speed (e.g. `5` = +50%).
 *   **`.voice`** — Shows current voice status, speed, and whether character mode is active.
-*   TTS preserves punctuation in both standard and character voice modes. Set `voice_strip_punct: true` in a bot parameter file only to enable the legacy quoted-dialogue punctuation stripping behavior.
+*   **`.voice punct [on/off]`** — Controls punctuation in spoken audio. `on` (default) keeps punctuation, so Edge TTS pauses naturally at commas and full stops. `off` strips punctuation from quoted dialogue, which makes the voice read without pauses (legacy run-on mode). The setting is saved per bot as `voice_strip_punct` (`off` sets it to `true`).
+*   TTS preserves punctuation in both standard and character voice modes by default. Use `.voice punct off` (or set `voice_strip_punct: true` in a bot parameter file) only if you want the legacy quoted-dialogue punctuation stripping behavior.
 
 #### Character Voice (multi-voice narration)
 *   **`.voice char on`** — Enables **character voice mode**. This also turns on standard voice automatically. In this mode, the bot:

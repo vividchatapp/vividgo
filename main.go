@@ -92,6 +92,41 @@ func sanitizeFilename(name string) string {
 	return safe
 }
 
+// commandArg extracts the argument text of a raw command message, skipping the
+// first `skip` whitespace-separated tokens. Unlike strings.Fields (which splits
+// on every space), this keeps the whole remainder of the line, so multi-word
+// arguments such as chapter names ("The Awakening of Sakura") survive, and it
+// strips surrounding quotes when the user typed them (chapter save "My Chapter").
+func commandArg(raw string, skip int) string {
+	rest := raw
+	for i := 0; i < skip; i++ {
+		trimmed := strings.TrimLeft(rest, " \t\r\n")
+		sep := strings.IndexAny(trimmed, " \t\r\n")
+		if sep == -1 {
+			return ""
+		}
+		rest = trimmed[sep:]
+	}
+	return trimQuotes(strings.TrimSpace(rest))
+}
+
+// trimQuotes removes a single matching pair of surrounding quotes (straight or
+// typographic) from s, along with any whitespace left behind.
+func trimQuotes(s string) string {
+	pairs := [][2]string{
+		{"\"", "\""},
+		{"'", "'"},
+		{"\u201c", "\u201d"},
+		{"\u2018", "\u2019"},
+	}
+	for _, p := range pairs {
+		if len(s) >= len(p[0])+len(p[1]) && strings.HasPrefix(s, p[0]) && strings.HasSuffix(s, p[1]) {
+			return strings.TrimSpace(s[len(p[0]) : len(s)-len(p[1])])
+		}
+	}
+	return s
+}
+
 // pruneTraceFiles removes the oldest trace files in a bot's directory
 // beyond maxTraceFilesPerBot.
 func pruneTraceFiles(botTraceDir string) {
@@ -190,6 +225,20 @@ func onOff(b bool) string {
 	return "off"
 }
 
+// resolveStripPunct maps a ".voice punct" argument to the VoiceStripPunct setting.
+// "on"/"keep" keeps punctuation (strip=false); "off"/"strip" strips it (strip=true).
+// ok is false when the argument is not recognised.
+func resolveStripPunct(arg string) (strip bool, ok bool) {
+	switch strings.ToLower(strings.TrimSpace(arg)) {
+	case "on", "keep":
+		return false, true
+	case "off", "strip":
+		return true, true
+	default:
+		return false, false
+	}
+}
+
 // BotConfig holds the configuration for a single bot
 type BotConfig struct {
 	Name  string `yaml:"name"`
@@ -204,9 +253,13 @@ type ModelEntry struct {
 	APIBase string `yaml:"api_base"`
 }
 
-// OllamaConfig holds the Ollama API configuration for online models
+// OllamaConfig holds the API configuration for online models.
+// Each entry in Models carries its own api_base so different providers
+// (ollama.com, local Ollama, llama.cpp server, OpenAI-compatible, ...) can be mixed.
+// The top-level api_base field is legacy: still parsed so old config.yaml files
+// keep working, but it is never written anymore and is migrated into per-model values.
 type OllamaConfig struct {
-	APIBase string       `yaml:"api_base"`
+	APIBase string       `yaml:"api_base,omitempty"`
 	Models  []ModelEntry `yaml:"models"`
 }
 
@@ -348,17 +401,15 @@ func loadConfig() Config {
 				for _, bot := range cfg.Bots {
 					log.Printf("  - %s: %s (user %d)", bot.Name, bot.Token[:8]+"...", cfg.UserID)
 				}
-				if cfg.Ollama.APIBase == "" {
-					cfg.Ollama.APIBase = "https://api.ollama.com"
-				}
 				if len(cfg.Ollama.Models) == 0 {
 					cfg.Ollama.Models = []ModelEntry{
-						{Name: "default", Model: "gemma4:31b"},
+						{Name: "default", Model: "gemma4:31b", APIBase: "https://api.ollama.com"},
 					}
 				}
-				log.Printf("Ollama config: api_base=%s, %d model(s)", cfg.Ollama.APIBase, len(cfg.Ollama.Models))
+				migrateOllamaBases(&cfg)
+				log.Printf("Loaded %d provider(s) (per-model api_base)", len(cfg.Ollama.Models))
 				for _, model := range cfg.Ollama.Models {
-					log.Printf("  - %s: model=%s, api_base=%s, api_key=%s", model.Name, model.Model, getEffectiveAPIBase(model, cfg.Ollama.APIBase), maskKey(model.APIKey))
+					log.Printf("  - %s: model=%s, api_base=%s, api_key=%s", model.Name, model.Model, getEffectiveAPIBase(model), maskKey(model.APIKey))
 				}
 				return cfg
 			}
@@ -379,16 +430,17 @@ func loadConfig() Config {
 			cfg.UserID = id
 			cfg.Debug = os.Getenv("TELEGRAM_DEBUG") == "true"
 
-			// Load Ollama config from environment variables
-			cfg.Ollama.APIBase = os.Getenv("OLLAMA_API_BASE")
-			if cfg.Ollama.APIBase == "" {
-				cfg.Ollama.APIBase = "https://api.ollama.com"
+			// Load Ollama config from environment variables (per-model api_base).
+			envBase := os.Getenv("OLLAMA_API_BASE")
+			if envBase == "" {
+				envBase = "https://api.ollama.com"
 			}
 			cfg.Ollama.Models = []ModelEntry{
 				{
-					Name:   "default",
-					APIKey: os.Getenv("OLLAMA_API_KEY"),
-					Model:  os.Getenv("OLLAMA_MODEL"),
+					Name:    "default",
+					APIKey:  os.Getenv("OLLAMA_API_KEY"),
+					Model:   os.Getenv("OLLAMA_MODEL"),
+					APIBase: envBase,
 				},
 			}
 			if cfg.Ollama.Models[0].Model == "" {
@@ -404,12 +456,33 @@ func loadConfig() Config {
 	return cfg
 }
 
-// getEffectiveAPIBase returns the per-model API base if set, otherwise falls back to the global default.
-func getEffectiveAPIBase(modelEntry ModelEntry, globalBase string) string {
-	if modelEntry.APIBase != "" {
-		return modelEntry.APIBase
+// migrateOllamaBases moves the legacy top-level ollama.api_base into any model
+// entry that lacks its own api_base, then clears the global. Old config.yaml
+// files keep working; new files only carry per-model api_base values.
+func migrateOllamaBases(cfg *Config) {
+	global := strings.TrimSpace(cfg.Ollama.APIBase)
+	if global == "" {
+		global = "https://api.ollama.com"
 	}
-	return globalBase
+	for i := range cfg.Ollama.Models {
+		if strings.TrimSpace(cfg.Ollama.Models[i].APIBase) == "" {
+			cfg.Ollama.Models[i].APIBase = global
+		}
+	}
+	// Drop the legacy global so mixed providers are explicit per model.
+	cfg.Ollama.APIBase = ""
+}
+
+// getEffectiveAPIBase returns the per-model API base. The optional globalBase
+// arg is only honored for legacy configs that still carry ollama.api_base.
+func getEffectiveAPIBase(modelEntry ModelEntry, globalBase ...string) string {
+	if strings.TrimSpace(modelEntry.APIBase) != "" {
+		return strings.TrimRight(modelEntry.APIBase, "/")
+	}
+	if len(globalBase) > 0 && strings.TrimSpace(globalBase[0]) != "" {
+		return strings.TrimRight(globalBase[0], "/")
+	}
+	return "https://api.ollama.com"
 }
 
 // maskKey masks the middle portion of an API key for logging
@@ -483,11 +556,9 @@ func loadBotParams(botName string, defaultModel string) BotParams {
 	if params.VoiceSpeed == 0 {
 		params.VoiceSpeed = 2
 	}
-	// Preserve punctuation by default; set voice_strip_punct: true to opt into
-	// the legacy behavior for quoted dialogue.
-	if !params.VoiceStripPunct && !strings.Contains(string(data), "voice_strip_punct") {
-		params.VoiceStripPunct = false
-	}
+	// Punctuation is kept by default (VoiceStripPunct=false). Use ".voice punct off"
+	// or set voice_strip_punct: true in the param file to enable the legacy
+	// quoted-dialogue punctuation stripping behavior.
 
 	log.Printf("[%s] Loaded bot params from %s: provider=%d, model=%s, mode=%s, role=%s, story=%s, active_scenes=%v, active_characters=%v", botName, path, params.SelectedProvider, params.CurrentModel, params.CurrentMode, params.CurrentRole, params.CurrentStory, params.ActiveScenes, params.ActiveCharacters)
 	return params
@@ -670,16 +741,16 @@ func listStorySnapshots(storyName, botName string) ([]string, error) {
 	return names, nil
 }
 
-func loadThreadSnapshotByIndex(storyName, botName string, index int) ([]ContextMessage, error) {
+func loadChapterSnapshotByIndex(storyName, botName string, index int) ([]ContextMessage, error) {
 	snapshots, err := listStorySnapshots(storyName, botName)
 	if err != nil {
 		return nil, err
 	}
 	if len(snapshots) == 0 {
-		return nil, fmt.Errorf("no saved threads found in story %s", storyName)
+		return nil, fmt.Errorf("no saved chapters found in story %s", storyName)
 	}
 	if index < 1 || index > len(snapshots) {
-		return nil, fmt.Errorf("invalid thread number. choose 1-%d", len(snapshots))
+		return nil, fmt.Errorf("invalid chapter number. choose 1-%d", len(snapshots))
 	}
 	path := getStorySnapshotPath(storyName, botName, snapshots[index-1])
 	if _, err := os.Stat(path); err != nil {
@@ -860,41 +931,66 @@ func formatModelSize(size int64) string {
 	return fmt.Sprintf("%.1fGB", gb)
 }
 
-// listOllamaModels fetches available models from the Ollama API
+// listOllamaModels fetches available models. It tries the native Ollama
+// endpoint (/api/tags) first, then falls back to the OpenAI-compatible
+// endpoint (/v1/models) used by llama.cpp server and other providers.
 func listOllamaModels(apiBase string, apiKey string) ([]OllamaModel, error) {
 	baseURL := strings.TrimRight(apiBase, "/")
-	endpoint := baseURL + "/api/tags"
-
-	req, err := http.NewRequest("GET", endpoint, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-	if apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+apiKey)
-	}
+	baseURL = strings.TrimSuffix(baseURL, "/v1")
 
 	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch models: %w", err)
+	doGet := func(endpoint string) ([]byte, int, error) {
+		req, err := http.NewRequest("GET", endpoint, nil)
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to create request: %w", err)
+		}
+		if apiKey != "" {
+			req.Header.Set("Authorization", "Bearer "+apiKey)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to fetch models: %w", err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to read response: %w", err)
+		}
+		return body, resp.StatusCode, nil
 	}
-	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
+	// 1. Native Ollama: GET {base}/api/tags -> {"models":[{"name":...,"size":...}]}
+	if body, status, err := doGet(baseURL + "/api/tags"); err == nil && status == http.StatusOK {
+		var modelsResp OllamaModelsResponse
+		if err := json.Unmarshal(body, &modelsResp); err == nil && len(modelsResp.Models) > 0 {
+			return modelsResp.Models, nil
+		}
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
+	// 2. llama.cpp / OpenAI-compatible: GET {base}/v1/models -> {"data":[{"id":...}]}
+	if body, status, err := doGet(baseURL + "/v1/models"); err == nil && status == http.StatusOK {
+		var openAIResp struct {
+			Data []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(body, &openAIResp); err == nil && len(openAIResp.Data) > 0 {
+			models := make([]OllamaModel, 0, len(openAIResp.Data))
+			for _, m := range openAIResp.Data {
+				if m.ID != "" {
+					models = append(models, OllamaModel{Name: m.ID})
+				}
+			}
+			if len(models) > 0 {
+				return models, nil
+			}
+		}
+		return nil, fmt.Errorf("API returned no models at %s/v1/models", baseURL)
+	} else if err != nil {
+		return nil, err
+	} else {
+		return nil, fmt.Errorf("API returned status %d: %s", status, string(body))
 	}
-
-	var modelsResp OllamaModelsResponse
-	if err := json.Unmarshal(body, &modelsResp); err != nil {
-		return nil, fmt.Errorf("failed to parse models: %w", err)
-	}
-
-	return modelsResp.Models, nil
 }
 
 // isOllamaDotCom returns true if the apiBase points to api.ollama.com.
@@ -1002,11 +1098,16 @@ func saveFilteredModels(models []string) {
 	log.Printf("Saved %d filtered models to %s", len(models), filteredModelsFilePath)
 }
 
-// callOllamaAPI sends a chat request to the Ollama API and returns the response text
+// callOllamaAPI sends a chat request and returns the response text.
+// Native Ollama bases use POST /api/chat. Bases ending in /v1 (llama.cpp
+// server, OpenAI-compatible) route straight to POST /v1/chat/completions.
 func callOllamaAPI(botName string, apiBase string, modelEntry ModelEntry, systemPrompt string, context []ContextMessage, userMessage string, numCtx int, noThink bool) (string, error) {
 	// Determine the endpoint URL
-	// Use the native Ollama API endpoint /api/chat
 	baseURL := strings.TrimRight(apiBase, "/")
+	if strings.HasSuffix(baseURL, "/v1") {
+		// llama.cpp server / OpenAI-compatible base: use chat completions directly.
+		return callOllamaAPIOpenAI(botName, baseURL+"/chat/completions", modelEntry, systemPrompt, context, userMessage)
+	}
 	endpoint := baseURL + "/api/chat"
 
 	// Build the request using native Ollama format
@@ -1531,12 +1632,13 @@ func runBot(botCfg BotConfig, userID int64, ollamaCfg OllamaConfig, wg *sync.Wai
 			switch command {
 			case "help", "h":
 				responseText = `🤖 i5 Assistant Help
-📚 Stories & Threads
+📚 Stories & Chapters
 • story - List story folders
 • story [n] - Select story folder (clears scenes/chars)
-• thread - List saved threads in the current story
-• thread save [name] - Save the current chat as a named thread
-• thread load [n] - Load a saved thread by number
+• chapter / ch - List saved chapters in the current story
+• chapter [n] / ch [n] - Pick/load listed chapter by number
+• chapter save [name] / ch save [name] - Save current chat as a chapter
+• chapter load [n|name] / ch load [n|name] - Load a saved chapter
 
 👤 Characters
 • char - List characters in current story
@@ -1598,7 +1700,7 @@ func runBot(botCfg BotConfig, userID int64, ollamaCfg OllamaConfig, wg *sync.Wai
 	• voice char [on/off] - Multi-voice character narration
 	• voice list - Show character voice assignments
 	• voice change [n] [accent] - Change a character's voice (e.g. .voice change 2 deep southern accent)
-Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat, cl=clean, mf=modelsfiltered, sc=scene, hs=history, mo=mode, mc=llmctx`
+Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, ch=chapter, c=chat, cl=clean, mf=modelsfiltered, sc=scene, hs=history, mo=mode, mc=llmctx`
 
 			case "provider", "p":
 				if len(parts) == 1 {
@@ -2119,7 +2221,7 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat,
 				continue
 
 			case "voice":
-				// Voice output control: .voice on / .voice off / .voice speed <1-10> / .voice char [on/off]
+				// Voice output control: .voice on/off / .voice speed <1-10> / .voice char [on/off] / .voice punct [on/off]
 				if len(parts) >= 3 && strings.ToLower(parts[1]) == "speed" {
 					// .voice speed <1-10> - set voice speed (10% increments)
 					speed, err := strconv.Atoi(parts[2])
@@ -2151,6 +2253,25 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat,
 						}
 					} else {
 						responseText = fmt.Sprintf("Voice char mode is %s\nUsage: voice char [on/off]", onOff(botParams.VoiceChar))
+					}
+				} else if len(parts) >= 2 && strings.ToLower(parts[1]) == "punct" {
+					// .voice punct [on/off] - keep (on, default) or strip (off) punctuation
+					// in spoken audio. "off" strips punctuation from quoted dialogue, which
+					// makes Edge TTS read without pauses (legacy run-on behaviour).
+					if len(parts) >= 3 {
+						if strip, ok := resolveStripPunct(parts[2]); ok {
+							botParams.VoiceStripPunct = strip
+							saveBotParams(botCfg.Name, botParams)
+							if strip {
+								responseText = "Punctuation will be stripped from spoken dialogue (run-on mode)."
+							} else {
+								responseText = "Punctuation will be kept in spoken audio."
+							}
+						} else {
+							responseText = fmt.Sprintf("Punctuation is %s\nUsage: voice punct [on/off]", onOff(!botParams.VoiceStripPunct))
+						}
+					} else {
+						responseText = fmt.Sprintf("Punctuation is %s\nUsage: voice punct [on/off]", onOff(!botParams.VoiceStripPunct))
 					}
 				} else if len(parts) >= 2 && strings.ToLower(parts[1]) == "on" {
 					botParams.Voice = true
@@ -2204,7 +2325,7 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat,
 						}
 					}
 				} else {
-					responseText = fmt.Sprintf("Voice is %s, speed %d, char mode %s\nUsage: voice on/off, voice speed 1-10, voice char on/off, voice list, voice change [n] [accent]", onOff(botParams.Voice), botParams.VoiceSpeed, onOff(botParams.VoiceChar))
+					responseText = fmt.Sprintf("Voice is %s, speed %d, char mode %s, punctuation %s\nUsage: voice on/off, voice speed 1-10, voice char on/off, voice punct on/off, voice list, voice change [n] [accent]", onOff(botParams.Voice), botParams.VoiceSpeed, onOff(botParams.VoiceChar), onOff(!botParams.VoiceStripPunct))
 				}
 				sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
 				continue
@@ -2573,9 +2694,9 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat,
 					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
 					continue
 				} else if len(parts) >= 2 && parts[1] == "save" {
-					name := "autosave"
-					if len(parts) >= 3 {
-						name = parts[2]
+					name := commandArg(update.Message.Text, 2)
+					if name == "" {
+						name = "autosave"
 					}
 					path := getStorySnapshotPath(currentStory, botCfg.Name, name)
 					if err := rewriteChatLogFile(path, conversationContext, currentMode); err != nil {
@@ -2586,9 +2707,9 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat,
 					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
 					continue
 				} else if len(parts) >= 2 && parts[1] == "load" {
-					name := "autosave"
-					if len(parts) >= 3 {
-						name = parts[2]
+					name := commandArg(update.Message.Text, 2)
+					if name == "" {
+						name = "autosave"
 					}
 					path := getStorySnapshotPath(currentStory, botCfg.Name, name)
 					if _, err := os.Stat(path); err != nil {
@@ -2629,17 +2750,17 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat,
 					responseText = "Usage: story [n] | story save [name] | story load [name]"
 				}
 
-			case "thread":
+			case "chapter", "ch":
 				if len(parts) == 1 {
-					threads, err := listStorySnapshots(currentStory, botCfg.Name)
+					chapters, err := listStorySnapshots(currentStory, botCfg.Name)
 					if err != nil {
-						responseText = fmt.Sprintf("Error listing story threads: %v", err)
-					} else if len(threads) == 0 {
-						responseText = fmt.Sprintf("No saved threads in %s yet.", displayName(currentStory))
+						responseText = fmt.Sprintf("Error listing story chapters: %v", err)
+					} else if len(chapters) == 0 {
+						responseText = fmt.Sprintf("No saved chapters in %s yet.", displayName(currentStory))
 					} else {
 						var sb strings.Builder
-						sb.WriteString(fmt.Sprintf("Saved threads in '%s':\n", displayName(currentStory)))
-						for i, name := range threads {
+						sb.WriteString(fmt.Sprintf("Saved chapters in '%s':\n", displayName(currentStory)))
+						for i, name := range chapters {
 							sb.WriteString(fmt.Sprintf("  %d) %s\n", i+1, displayName(name)))
 						}
 						responseText = sb.String()
@@ -2648,44 +2769,43 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat,
 					continue
 				}
 				if len(parts) >= 2 && parts[1] == "save" {
-					name := "autosave"
-					if len(parts) >= 3 {
-						name = parts[2]
+					name := commandArg(update.Message.Text, 2)
+					if name == "" {
+						name = "autosave"
 					}
 					path := getStorySnapshotPath(currentStory, botCfg.Name, name)
 					if err := rewriteChatLogFile(path, conversationContext, currentMode); err != nil {
-						responseText = fmt.Sprintf("Failed to save thread '%s': %v", name, err)
+						responseText = fmt.Sprintf("Failed to save chapter '%s': %v", name, err)
 					} else {
-						responseText = fmt.Sprintf("Saved thread '%s' in %s.", name, displayName(currentStory))
+						responseText = fmt.Sprintf("Saved chapter '%s' in %s.", name, displayName(currentStory))
 					}
 					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
 					continue
 				}
 				if len(parts) >= 2 && parts[1] == "load" {
-					if len(parts) == 3 {
-						if num, err := strconv.Atoi(parts[2]); err == nil {
-							loaded, err := loadThreadSnapshotByIndex(currentStory, botCfg.Name, num)
-							if err != nil {
-								responseText = err.Error()
-							} else {
-								conversationContext = loaded
-								responseText = fmt.Sprintf("Loaded thread #%d from %s.", num, displayName(currentStory))
-							}
-							sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-							continue
+					arg := commandArg(update.Message.Text, 2)
+					if num, err := strconv.Atoi(arg); err == nil {
+						loaded, err := loadChapterSnapshotByIndex(currentStory, botCfg.Name, num)
+						if err != nil {
+							responseText = err.Error()
+						} else {
+							conversationContext = loaded
+							responseText = fmt.Sprintf("Loaded chapter #%d from %s.", num, displayName(currentStory))
 						}
+						sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
+						continue
 					}
-					name := "autosave"
-					if len(parts) >= 3 {
-						name = parts[2]
+					name := arg
+					if name == "" {
+						name = "autosave"
 					}
 					path := getStorySnapshotPath(currentStory, botCfg.Name, name)
 					if _, err := os.Stat(path); err != nil {
-						responseText = fmt.Sprintf("No saved thread named '%s' in %s.", name, displayName(currentStory))
+						responseText = fmt.Sprintf("No saved chapter named '%s' in %s.", name, displayName(currentStory))
 					} else {
 						loaded := loadChatHistory(path)
 						conversationContext = loaded
-						responseText = fmt.Sprintf("Loaded thread '%s' from %s.", name, displayName(currentStory))
+						responseText = fmt.Sprintf("Loaded chapter '%s' from %s.", name, displayName(currentStory))
 					}
 					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
 					continue
@@ -2693,20 +2813,20 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, c=chat,
 				if len(parts) == 2 {
 					num, err := strconv.Atoi(parts[1])
 					if err != nil {
-						responseText = "Usage: thread [list] | thread save [name] | thread load [number|name]"
+						responseText = "Usage: chapter [list] | chapter [n] | chapter save [name] | chapter load [number|name]"
 					} else {
-						loaded, err := loadThreadSnapshotByIndex(currentStory, botCfg.Name, num)
+						loaded, err := loadChapterSnapshotByIndex(currentStory, botCfg.Name, num)
 						if err != nil {
 							responseText = err.Error()
 						} else {
 							conversationContext = loaded
-							responseText = fmt.Sprintf("Loaded thread #%d from %s.", num, displayName(currentStory))
+							responseText = fmt.Sprintf("Loaded chapter #%d from %s.", num, displayName(currentStory))
 						}
 					}
 					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
 					continue
 				}
-				responseText = "Usage: thread | thread save [name] | thread load [number|name]"
+				responseText = "Usage: chapter [list] | chapter [n] | chapter save [name] | chapter load [number|name]"
 				sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
 				continue
 

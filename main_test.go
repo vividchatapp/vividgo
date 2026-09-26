@@ -109,18 +109,30 @@ func TestPruneTraceFiles(t *testing.T) {
 	}
 }
 
-func TestLocalTTSRateConversion(t *testing.T) {
-	if got := parseLocalTTSRate("+0%"); got != 0 {
-		t.Fatalf("expected 0 for +0%%, got %d", got)
+func TestDetectAudioExtension(t *testing.T) {
+	// MP3 with an ID3 tag header
+	if got := detectAudioExtension([]byte{'I', 'D', '3', 0x04, 0x00, 0x00}); got != ".mp3" {
+		t.Fatalf("expected .mp3 for ID3 header, got %s", got)
 	}
-	if got := parseLocalTTSRate("+50%"); got != 5 {
-		t.Fatalf("expected 5 for +50%%, got %d", got)
+	// MP3 without an ID3 tag: raw MPEG frame sync (0xFF 0xEx)
+	if got := detectAudioExtension([]byte{0xFF, 0xFB, 0x90, 0x00}); got != ".mp3" {
+		t.Fatalf("expected .mp3 for MPEG frame sync, got %s", got)
 	}
-	if got := parseLocalTTSRate("-20%"); got != -2 {
-		t.Fatalf("expected -2 for -20%%, got %d", got)
+	// RIFF....WAVE header
+	if got := detectAudioExtension([]byte("RIFF\x00\x00\x00\x00WAVE")); got != ".wav" {
+		t.Fatalf("expected .wav for RIFF/WAVE header, got %s", got)
 	}
-	if got := parseLocalTTSRate("invalid"); got != 0 {
-		t.Fatalf("expected 0 for invalid rate, got %d", got)
+	// Unknown or empty data falls back to .mp3 (the Edge TTS output format)
+	if got := detectAudioExtension(nil); got != ".mp3" {
+		t.Fatalf("expected .mp3 fallback, got %s", got)
+	}
+}
+
+func TestDefaultVoiceIsEdgeNeural(t *testing.T) {
+	// Regression guard: speech must use the Edge neural voice, never a local
+	// operating-system voice.
+	if defaultVoice != "en-GB-SoniaNeural" {
+		t.Fatalf("expected default Edge TTS voice en-GB-SoniaNeural, got %s", defaultVoice)
 	}
 }
 
@@ -160,7 +172,7 @@ func TestSaveAndLoadStorySnapshot(t *testing.T) {
 	}
 }
 
-func TestThreadSnapshotListAndLoad(t *testing.T) {
+func TestChapterSnapshotListAndLoad(t *testing.T) {
 	oldWD, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("failed to get working dir: %v", err)
@@ -183,20 +195,20 @@ func TestThreadSnapshotListAndLoad(t *testing.T) {
 		t.Fatalf("save chapter two snapshot returned error: %v", err)
 	}
 
-	threads, err := listStorySnapshots("my_story", "bot1")
+	chapters, err := listStorySnapshots("my_story", "bot1")
 	if err != nil {
 		t.Fatalf("listStorySnapshots returned error: %v", err)
 	}
-	if len(threads) < 2 {
-		t.Fatalf("expected at least 2 thread snapshots, got %d: %#v", len(threads), threads)
+	if len(chapters) < 2 {
+		t.Fatalf("expected at least 2 chapter snapshots, got %d: %#v", len(chapters), chapters)
 	}
 
-	loaded, err := loadThreadSnapshotByIndex("my_story", "bot1", 2)
+	loaded, err := loadChapterSnapshotByIndex("my_story", "bot1", 2)
 	if err != nil {
-		t.Fatalf("loadThreadSnapshotByIndex returned error: %v", err)
+		t.Fatalf("loadChapterSnapshotByIndex returned error: %v", err)
 	}
 	if len(loaded) != 1 || loaded[0].Content != "chapter two" {
-		t.Fatalf("thread load by index returned unexpected content: %#v", loaded)
+		t.Fatalf("chapter load by index returned unexpected content: %#v", loaded)
 	}
 }
 
@@ -266,3 +278,179 @@ func TestLoadBotParams(t *testing.T) {
 	// Restore original config folder if it existed, handled by defer
 	_ = configExists
 }
+
+func TestCommandArg(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		skip int
+		want string
+	}{
+		{"multi word chapter name", ".chapter save The Awakening of Sakura", 2, "The Awakening of Sakura"},
+		{"double quoted chapter name", ".ch save \"The Awakening of Sakura\"", 2, "The Awakening of Sakura"},
+		{"single quoted chapter name", ".ch save 'My Chapter'", 2, "My Chapter"},
+		{"typographic quotes", ".chapter save \u201cChapter One\u201d", 2, "Chapter One"},
+		{"extra surrounding whitespace trimmed", ".chapter save   Spaced  Name  ", 2, "Spaced  Name"},
+		{"multi word story snapshot name", ".story save Night Run", 2, "Night Run"},
+		{"quoted story snapshot name", ".story load \"Night Run\"", 2, "Night Run"},
+		{"numeric argument preserved", ".chapter load 3", 2, "3"},
+		{"quoted numeric argument unwrapped", ".chapter load \"3\"", 2, "3"},
+		{"missing argument", ".chapter save", 2, ""},
+		{"command without argument", ".chapter", 2, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := commandArg(tt.raw, tt.skip); got != tt.want {
+				t.Fatalf("commandArg(%q, %d) = %q, want %q", tt.raw, tt.skip, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTrimQuotes(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"\"quoted\"", "quoted"},
+		{"'quoted'", "quoted"},
+		{"\u201cquoted\u201d", "quoted"},
+		{"\u2018quoted\u2019", "quoted"},
+		{"unquoted", "unquoted"},
+		{"\"unbalanced", "\"unbalanced"},
+		{"\"", "\""},
+		{"\"\"", ""},
+	}
+	for _, tt := range tests {
+		if got := trimQuotes(tt.input); got != tt.want {
+			t.Errorf("trimQuotes(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestMultiWordChapterNameRoundTrip(t *testing.T) {
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get working dir: %v", err)
+	}
+	tmpDir := t.TempDir()
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("failed to chdir to temp dir: %v", err)
+	}
+	defer func() {
+		_ = os.Chdir(oldWD)
+	}()
+
+	const chapterName = "The Awakening of Sakura"
+	name := commandArg(".chapter save "+chapterName, 2)
+	if name != chapterName {
+		t.Fatalf("chapter save parsed name %q, want %q", name, chapterName)
+	}
+
+	context := []ContextMessage{{Role: "assistant", Content: "sakura awakens"}}
+	if err := rewriteChatLogFile(getStorySnapshotPath("my_story", "bot1", name), context, "story"); err != nil {
+		t.Fatalf("saving chapter snapshot returned error: %v", err)
+	}
+
+	chapters, err := listStorySnapshots("my_story", "bot1")
+	if err != nil {
+		t.Fatalf("listStorySnapshots returned error: %v", err)
+	}
+	if len(chapters) != 1 || chapters[0] != chapterName {
+		t.Fatalf("listStorySnapshots returned %#v, want a single entry %q", chapters, chapterName)
+	}
+
+	loaded, err := loadChapterSnapshotByIndex("my_story", "bot1", 1)
+	if err != nil {
+		t.Fatalf("loadChapterSnapshotByIndex returned error: %v", err)
+	}
+	if len(loaded) != 1 || loaded[0].Content != "sakura awakens" {
+		t.Fatalf("loaded chapter content = %#v, want the saved exchange", loaded)
+	}
+
+	// A quoted name must resolve to the same snapshot file as the unquoted one.
+	quoted := commandArg(".chapter save \""+chapterName+"\"", 2)
+	if quoted != name {
+		t.Fatalf("quoted name parsed as %q, want %q", quoted, name)
+	}
+	if qp, p := getStorySnapshotPath("my_story", "bot1", quoted), getStorySnapshotPath("my_story", "bot1", name); qp != p {
+		t.Fatalf("quoted name resolved to %q, want %q", qp, p)
+	}
+}
+
+func TestResolveStripPunct(t *testing.T) {
+	tests := []struct {
+		arg       string
+		wantStrip bool
+		wantOK    bool
+	}{
+		{"on", false, true},
+		{"ON", false, true},
+		{"on ", false, true},
+		{"keep", false, true},
+		{"off", true, true},
+		{"Off", true, true},
+		{"strip", true, true},
+		{"banana", false, false},
+		{"", false, false},
+	}
+	for _, tt := range tests {
+		strip, ok := resolveStripPunct(tt.arg)
+		if strip != tt.wantStrip || ok != tt.wantOK {
+			t.Errorf("resolveStripPunct(%q) = (%v, %v), want (%v, %v)", tt.arg, strip, ok, tt.wantStrip, tt.wantOK)
+		}
+	}
+}
+
+func TestVoicePunctSettingPersists(t *testing.T) {
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get working dir: %v", err)
+	}
+	tmpDir := t.TempDir()
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("failed to chdir to temp dir: %v", err)
+	}
+	defer func() {
+		_ = os.Chdir(oldWD)
+	}()
+
+	if err := os.MkdirAll("config", 0755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+
+	// ".voice punct off" strips punctuation (VoiceStripPunct=true) and must
+	// survive a save/load round trip so the toggle sticks across restarts.
+	strip, ok := resolveStripPunct("off")
+	if !ok || !strip {
+		t.Fatalf("resolveStripPunct(\"off\") = (%v, %v), want (true, true)", strip, ok)
+	}
+	saveBotParams("punctbot", BotParams{
+		SelectedProvider: 0,
+		CurrentModel:     "test-model",
+		CurrentMode:      "chat",
+		VoiceSpeed:       2,
+		VoiceStripPunct:  strip,
+	})
+	if loaded := loadBotParams("punctbot", "test-model"); !loaded.VoiceStripPunct {
+		t.Fatalf("VoiceStripPunct did not persist after \".voice punct off\": got %v, want true", loaded.VoiceStripPunct)
+	}
+
+	// ".voice punct on" keeps punctuation (VoiceStripPunct=false) and must
+	// persist the opposite state.
+	strip, ok = resolveStripPunct("on")
+	if !ok || strip {
+		t.Fatalf("resolveStripPunct(\"on\") = (%v, %v), want (false, true)", strip, ok)
+	}
+	saveBotParams("punctbot", BotParams{
+		SelectedProvider: 0,
+		CurrentModel:     "test-model",
+		CurrentMode:      "chat",
+		VoiceSpeed:       2,
+		VoiceStripPunct:  strip,
+	})
+	if loaded := loadBotParams("punctbot", "test-model"); loaded.VoiceStripPunct {
+		t.Fatalf("VoiceStripPunct did not persist after \".voice punct on\": got %v, want false", loaded.VoiceStripPunct)
+	}
+}
+
