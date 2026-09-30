@@ -454,3 +454,124 @@ func TestVoicePunctSettingPersists(t *testing.T) {
 	}
 }
 
+func TestNormalizeStoryName(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"general", "general"},
+		{"Night Run", "night_run"},
+		{"My New Story", "my_new_story"},
+		{"  spaced   name  ", "spaced_name"},
+		{"Dax Dr Ren", "dax_dr_ren"},
+		{"My Story: Part 2", "my_story_part_2"},
+		{"trailing dots...", "trailing_dots"},
+		{"", ""},
+		{"   ", ""},
+		{"...", ""},
+	}
+	for _, tt := range tests {
+		if got := normalizeStoryName(tt.in); got != tt.want {
+			t.Errorf("normalizeStoryName(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestCreateStoryFolders(t *testing.T) {
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get working dir: %v", err)
+	}
+	tmpDir := t.TempDir()
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("failed to chdir to temp dir: %v", err)
+	}
+	defer func() {
+		_ = os.Chdir(oldWD)
+	}()
+
+	// ".story create Night Run" must land in a folder-safe "night_run" story.
+	name := normalizeStoryName("Night Run")
+	if name != "night_run" {
+		t.Fatalf("normalizeStoryName(%q) = %q, want %q", "Night Run", name, "night_run")
+	}
+
+	existed, err := createStoryFolders(name)
+	if err != nil {
+		t.Fatalf("createStoryFolders returned error: %v", err)
+	}
+	if existed {
+		t.Fatalf("createStoryFolders reported the brand new story %q as already existing", name)
+	}
+
+	for _, sub := range []string{"chat", "scenes", "characters"} {
+		path := filepath.Join("stories", name, sub)
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("expected %s to exist: %v", path, err)
+		}
+		if !info.IsDir() {
+			t.Fatalf("expected %s to be a directory", path)
+		}
+	}
+
+	// Creating an existing story again must be idempotent and report existence.
+	existed, err = createStoryFolders(name)
+	if err != nil {
+		t.Fatalf("second createStoryFolders call returned error: %v", err)
+	}
+	if !existed {
+		t.Fatalf("second createStoryFolders call reported the existing story %q as new", name)
+	}
+
+	// The new story must appear in the ".story" listing shown to the user.
+	stories, err := listStoryFolders()
+	if err != nil {
+		t.Fatalf("listStoryFolders returned error: %v", err)
+	}
+	found := false
+	for _, s := range stories {
+		if s == name {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("listStoryFolders() = %#v, want it to contain %q", stories, name)
+	}
+}
+
+func TestLoadStoryContext(t *testing.T) {
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get working dir: %v", err)
+	}
+	tmpDir := t.TempDir()
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("failed to chdir to temp dir: %v", err)
+	}
+	defer func() {
+		_ = os.Chdir(oldWD)
+	}()
+
+	// "story_a" already has history, "story_b" is brand new.
+	appendToChatLog(getChatLogPath("story_a", "bot1"), "user", "hello from a")
+	appendToChatLog(getChatLogPath("story_a", "bot1"), "assistant", "reply from a")
+
+	loaded := loadStoryContext("story_a", "bot1")
+	if len(loaded) != 2 {
+		t.Fatalf("loadStoryContext(story_a, bot1) returned %d messages, want 2: %#v", len(loaded), loaded)
+	}
+	if loaded[0].Role != "user" || loaded[0].Content != "hello from a" {
+		t.Fatalf("first loaded message = %#v, want the user message saved to story_a", loaded[0])
+	}
+	if loaded[1].Role != "assistant" || loaded[1].Content != "reply from a" {
+		t.Fatalf("second loaded message = %#v, want the assistant message saved to story_a", loaded[1])
+	}
+
+	// Switching to a story with no chat log must yield an empty context instead
+	// of keeping the previous story's history in memory.
+	if fresh := loadStoryContext("story_b", "bot1"); len(fresh) != 0 {
+		t.Fatalf("loadStoryContext(story_b, bot1) = %#v, want an empty context", fresh)
+	}
+}
+

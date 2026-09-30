@@ -624,6 +624,53 @@ func listStoryFolders() ([]string, error) {
 	return stories, nil
 }
 
+// normalizeStoryName converts user input into a folder-safe story name.
+// Whitespace is collapsed into single underscores and the result is lowercased
+// to match the existing naming convention (e.g. "My New Story" becomes
+// "my_new_story"). It returns "" when the input cannot form a valid story name.
+func normalizeStoryName(name string) string {
+	slug := strings.Join(strings.Fields(name), "_")
+	if slug == "" {
+		return ""
+	}
+	slug = sanitizeFilename(strings.ToLower(slug))
+	// sanitizeFilename does not cover ":" or "?", both of which are invalid in
+	// Windows folder names, so replace them here too.
+	slug = strings.NewReplacer(":", "_", "?", "_").Replace(slug)
+	// Collapse underscore runs left behind by replaced separators, so
+	// "My Story: Part 2" becomes "my_story_part_2" rather than "my_story__part_2".
+	for strings.Contains(slug, "__") {
+		slug = strings.ReplaceAll(slug, "__", "_")
+	}
+	// Trim leading/trailing dots and dashes: Windows rejects folder names that
+	// end in a dot, and leading dots would create hidden folders on Unix.
+	slug = strings.Trim(slug, "._-")
+	if slug == "" {
+		return ""
+	}
+	return slug
+}
+
+// createStoryFolders creates stories/<name>/ together with the chat, scenes and
+// characters sub-folders (the same layout as the default "general" story).
+// The bool return reports whether the story folder already existed, so callers
+// can tell a fresh story apart from an existing one. MkdirAll makes the call
+// idempotent, so switching to an existing story is harmless.
+func createStoryFolders(name string) (bool, error) {
+	root := filepath.Join("stories", name)
+	existed := false
+	if info, err := os.Stat(root); err == nil && info.IsDir() {
+		existed = true
+	}
+	for _, sub := range []string{"", "chat", "scenes", "characters"} {
+		dir := filepath.Join(root, sub)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return existed, fmt.Errorf("failed to create directory %s: %w", dir, err)
+		}
+	}
+	return existed, nil
+}
+
 // getChatLogPath returns the path to the chat log file for a given bot and story.
 // It ensures the chat/ subdirectory exists.
 func getChatLogPath(storyName, botName string) string {
@@ -827,6 +874,14 @@ func loadChatHistory(path string) []ContextMessage {
 	}
 
 	return messages
+}
+
+// loadStoryContext loads a story's saved chat history for a bot and returns it
+// as conversation context. It is used when switching stories so the in-memory
+// context follows the story being switched to; a story without a chat log yet
+// yields an empty context (getChatLogPath creates the chat folder if needed).
+func loadStoryContext(story, botName string) []ContextMessage {
+	return loadChatHistory(getChatLogPath(story, botName))
 }
 
 // listSceneFiles returns a sorted list of scene file names (without extension) for a given story
@@ -1550,6 +1605,34 @@ func runBot(botCfg BotConfig, userID int64, ollamaCfg OllamaConfig, wg *sync.Wai
 
 	log.Printf("[%s] Initialized with provider=%d, mode=%s, model=%s, story=%s", botCfg.Name, selectedProvider, currentMode, botParams.CurrentModel, currentStory)
 
+	// selectStory switches the bot to the named story folder: it clears the
+	// active scenes and characters (those lists are per-story), persists the
+	// selection, and reloads the conversation context from the target story's
+	// chat history so the bot stops carrying the previous story's memory.
+	// The number of messages loaded is returned for the user-facing reply.
+	selectStory := func(name string) int {
+		currentStory = name
+		activeScenes = make(map[int]bool)
+		activeCharacters = make(map[int]bool)
+		botParams.CurrentStory = name
+		botParams.ActiveScenes = []int{}
+		botParams.ActiveCharacters = []int{}
+		saveBotParams(botCfg.Name, botParams)
+
+		// Swap in the new story's history (empty when it has no log yet).
+		conversationContext = loadStoryContext(name, botCfg.Name)
+		if conversationContext == nil {
+			conversationContext = []ContextMessage{}
+		}
+		// The tracked Telegram messages belong to the story we just left, so
+		// forget them: otherwise "del" would delete unrelated messages and trim
+		// the freshly loaded context of the new story.
+		lastUserMsgID = 0
+		lastAssistantMsgIDs = nil
+		log.Printf("[%s] Switched to story %s, loaded %d context messages", botCfg.Name, name, len(conversationContext))
+		return len(conversationContext)
+	}
+
 	// estimateTokens provides a rough estimate of token count from the context messages
 	estimateTokens := func(ctx []ContextMessage) int {
 		total := 0
@@ -1634,7 +1717,9 @@ func runBot(botCfg BotConfig, userID int64, ollamaCfg OllamaConfig, wg *sync.Wai
 				responseText = `🤖 i5 Assistant Help
 📚 Stories & Chapters
 • story - List story folders
-• story [n] - Select story folder (clears scenes/chars)
+• story [n] - Select story folder (clears scenes/chars, loads its chat history)
+• story create [name] - Create a new story folder and switch to it
+• story save [name] / story load [name] - Save/load a story snapshot
 • chapter / ch - List saved chapters in the current story
 • chapter [n] / ch [n] - Pick/load listed chapter by number
 • chapter save [name] / ch save [name] - Save current chat as a chapter
@@ -2721,6 +2806,23 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, ch=chap
 					}
 					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
 					continue
+				} else if len(parts) >= 2 && parts[1] == "create" {
+					// story create [name] - create a new story folder and switch to it
+					name := normalizeStoryName(commandArg(update.Message.Text, 2))
+					if name == "" {
+						responseText = "Usage: story create [name] - create a new story folder and switch to it"
+					} else if existed, err := createStoryFolders(name); err != nil {
+						responseText = fmt.Sprintf("Failed to create story '%s': %v", name, err)
+					} else {
+						loaded := selectStory(name)
+						if existed {
+							responseText = fmt.Sprintf("Story '%s' already exists — switched to it (%d messages loaded).", displayName(name), loaded)
+						} else {
+							responseText = fmt.Sprintf("Created story '%s' and switched to it.", displayName(name))
+						}
+					}
+					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
+					continue
 				} else if len(parts) == 2 {
 					// story [n] - select a story by number
 					num, err := strconv.Atoi(parts[1])
@@ -2733,21 +2835,14 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, ch=chap
 						} else if num < 1 || num > len(stories) {
 							responseText = fmt.Sprintf("Invalid story number. Please choose 1-%d.", len(stories))
 						} else {
-							currentStory = stories[num-1]
-							// Clear active scenes and characters when switching stories
-							activeScenes = make(map[int]bool)
-							activeCharacters = make(map[int]bool)
-							botParams.CurrentStory = currentStory
-							botParams.ActiveScenes = []int{}
-							botParams.ActiveCharacters = []int{}
-							saveBotParams(botCfg.Name, botParams)
-							responseText = fmt.Sprintf("Switched to story: %s", displayName(currentStory))
+							loaded := selectStory(stories[num-1])
+							responseText = fmt.Sprintf("Switched to story: %s (%d messages loaded)", displayName(currentStory), loaded)
 						}
 					}
 					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
 					continue
 				} else {
-					responseText = "Usage: story [n] | story save [name] | story load [name]"
+					responseText = "Usage: story [n] | story create [name] | story save [name] | story load [name]"
 				}
 
 			case "chapter", "ch":

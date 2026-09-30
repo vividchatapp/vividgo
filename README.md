@@ -27,6 +27,8 @@ For background-launch examples and Unix/Linux/macOS launcher scripts, see the ex
 ### Story & Roleplay Mode
 - **Story mode** with immersive narrative generation (Story Weaver)
 - Multiple story folders under `stories/` with `chat/`, `scenes/`, and `characters/`
+- Create and switch stories from chat (`story create [name]`) — the new story folder is created with its `chat/`, `scenes/`, and `characters/` sub-folders
+- Switching stories (`.story [n]`) reloads that story's chat history into the context, so every story keeps its own memory
 - Active scene and character injection into prompts
 - **Chat mode** for regular conversation with full history
 
@@ -112,7 +114,10 @@ All commands start with a dot (`.`) or can be used without it. Type `.help` in T
 | Command | Description |
 |---------|-------------|
 | `.story` | List story folders |
-| `.story [n]` | Select story folder (clears scenes/chars) |
+| `.story [n]` | Select story folder (clears scenes/chars, loads that story's chat history into context) |
+| `.story create [name]` | Create a new story folder (`chat/`, `scenes/`, `characters/`) and switch to it |
+| `.story save [name]` | Save current conversation as a story snapshot |
+| `.story load [name]` | Load a saved story snapshot |
 | `.chapter` / `.ch` | List saved chapters in current story |
 | `.chapter [n]` / `.ch [n]` | Pick/load listed chapter by number |
 | `.chapter save [name]` / `.ch save [name]` | Save current conversation as a chapter |
