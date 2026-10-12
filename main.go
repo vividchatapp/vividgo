@@ -1711,6 +1711,10 @@ func runBot(botCfg BotConfig, userID int64, ollamaCfg OllamaConfig, wg *sync.Wai
 			// voiceThisResponse is set to true for AI-generated responses (chat and resend),
 			// so sendVoiceAudio is called after the text is sent. Command responses are not spoken.
 			voiceThisResponse := false
+			// checkContextWarn is set to true for AI-generated responses so the
+			// context-limit warning is sent after the reply (it used to be sent
+			// before the reply, which made it easy to miss).
+			checkContextWarn := false
 
 			switch command {
 			case "help", "h":
@@ -3341,8 +3345,8 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, ch=chap
 					conversationContext = conversationContext[len(conversationContext)-contextLimit:]
 				}
 
-				// Check context warning after processing response
-				sendContextWarning(conversationContext, botParams.NumCtx, botCfg.Name, update.Message.Chat.ID)
+				// Flag the context-limit warning so it is sent after the reply
+				checkContextWarn = true
 				voiceThisResponse = true
 
 			default:
@@ -3466,8 +3470,8 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, ch=chap
 					conversationContext = conversationContext[len(conversationContext)-contextLimit:]
 				}
 
-				// Check context warning after processing response
-				sendContextWarning(conversationContext, botParams.NumCtx, botCfg.Name, update.Message.Chat.ID)
+				// Flag the context-limit warning so it is sent after the reply
+				checkContextWarn = true
 				voiceThisResponse = true
 			}
 
@@ -3514,6 +3518,12 @@ Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, ch=chap
 				}
 
 				remainingText = remainingText[len(chunk):]
+			}
+
+			// Send the context-limit warning after the reply so the user sees the
+			// message first (it was previously sent before the reply and easy to miss).
+			if checkContextWarn {
+				sendContextWarning(conversationContext, botParams.NumCtx, botCfg.Name, update.Message.Chat.ID)
 			}
 
 			// If this was an AI-generated response and voice is enabled, send the audio too
