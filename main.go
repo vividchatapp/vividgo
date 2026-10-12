@@ -245,12 +245,28 @@ type BotConfig struct {
 	Token string `yaml:"token"`
 }
 
+// ProviderType identifies which LLM backend a ModelEntry routes to.
+const (
+	ProviderTypeOllama = "ollama"
+	ProviderTypeGoogle = "google"
+)
+
+// providerTypeOf normalizes a ModelEntry type, defaulting legacy entries to ollama.
+func providerTypeOf(e ModelEntry) string {
+	t := strings.ToLower(strings.TrimSpace(e.Type))
+	if t == ProviderTypeGoogle || t == "gemini" {
+		return ProviderTypeGoogle
+	}
+	return ProviderTypeOllama
+}
+
 // ModelEntry holds a single model configuration with name, API key, and API base URL
 type ModelEntry struct {
 	Name    string `yaml:"name"`
 	APIKey  string `yaml:"api_key"`
 	Model   string `yaml:"model"`
 	APIBase string `yaml:"api_base"`
+	Type    string `yaml:"type,omitempty"`
 }
 
 // OllamaConfig holds the API configuration for online models.
@@ -1515,20 +1531,39 @@ func sendVoiceAudio(bot *tgbotapi.BotAPI, chatID int64, text string, botName str
 	} else {
 		log.Printf("[%s] Sent voice audio (message ID %d)", botName, sentMsg.MessageID)
 	}
+	// Mirror the audio to open web chat pages so the browser can play it too.
+	publishVoiceAudio(botName, audioBytes)
 }
 
-func runBot(botCfg BotConfig, userID int64, ollamaCfg OllamaConfig, wg *sync.WaitGroup) {
+// runBot attaches the Telegram transport to an existing BotSession and drives
+// it from the long-polling loop.
+//
+// All command handling lives in HandleMessage (commands.go); this function is
+// only responsible for Telegram-specific rendering: MarkdownV2 escaping,
+// chunking, auto-delete of command replies, the context-limit warning and
+// voice audio. The session itself is created and registered in main() so the
+// web transport keeps working even when the token here is invalid.
+func runBot(s *BotSession, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	bot, err := tgbotapi.NewBotAPI(botCfg.Token)
+	bot, err := tgbotapi.NewBotAPI(s.botCfg.Token)
 	if err != nil {
-		log.Printf("[%s] Failed to start bot: %v", botCfg.Name, err)
+		log.Printf("[%s] Failed to start bot: %v", s.botCfg.Name, err)
 		return
 	}
 
 	bot.Debug = false // can be overridden from config if needed
 
-	log.Printf("[%s] Authorized on account %s", botCfg.Name, bot.Self.UserName)
+	// Register sender so web chat can forward replies to Telegram (shared session).
+	registerTelegramSender(s.botCfg.Name, bot)
+
+	s.mu.Lock()
+	s.bot = bot
+	userID := s.userID
+	botCfg := s.botCfg
+	s.mu.Unlock()
+
+	log.Printf("[%s] Authorized on account %s", s.botCfg.Name, bot.Self.UserName)
 
 	// Create a new update config with long polling timeout
 	u := tgbotapi.NewUpdate(0)
@@ -1536,2013 +1571,132 @@ func runBot(botCfg BotConfig, userID int64, ollamaCfg OllamaConfig, wg *sync.Wai
 
 	updates := bot.GetUpdatesChan(u)
 
-	// Load persisted bot params (selected provider, model, mode) from config/<botname>_bot_params.yaml
-	defaultModel := ollamaCfg.Models[0].Model
-	botParams := loadBotParams(botCfg.Name, defaultModel)
-
-	// Validate selectedProvider against available models
-	selectedProvider := botParams.SelectedProvider
-	if selectedProvider < 0 || selectedProvider >= len(ollamaCfg.Models) {
-		selectedProvider = 0
-	}
-
-	// Apply the loaded model to the selected provider
-	if botParams.CurrentModel != "" {
-		ollamaCfg.Models[selectedProvider].Model = botParams.CurrentModel
-	}
-
-	// Track the current mode: "chat" or "story"
-	currentMode := botParams.CurrentMode
-	if currentMode != "chat" && currentMode != "story" {
-		currentMode = "chat"
-	}
-
-	// Initialize the message ledger for tracking and UI cleanup
-	var ledger MessageLedger
-
-	// Track the last user message ID and assistant response IDs for /del Telegram UI cleanup
-	var lastUserMsgID int
-	var lastAssistantMsgIDs []int
-	var lastUserText string
-
-	// Initialize voice character assignments (maps speaker name to assigned voice)
-	voiceCharAssignments := make(map[string]string)
-	// Restore voice assignments from persisted params so they survive restarts
-	if botParams.VoiceAssignments != nil {
-		for k, v := range botParams.VoiceAssignments {
-			voiceCharAssignments[k] = v
-		}
-	}
-	SyncVoiceAssignments(&botParams, voiceCharAssignments)
-
-	// Initialize conversation context
-	var conversationContext []ContextMessage
-	contextLimit := 50
-
-	// Load chat history from disk to restore conversation context
-	chatLogPath := getChatLogPath(botParams.CurrentStory, botCfg.Name)
-	loadedHistory := loadChatHistory(chatLogPath)
-	if len(loadedHistory) > 0 {
-		conversationContext = loadedHistory
-		log.Printf("[%s] Loaded %d messages from chat history: %s", botCfg.Name, len(loadedHistory), chatLogPath)
-	}
-
-	// Initialize story/scene/character state
-	currentStory := botParams.CurrentStory
-	if currentStory == "" {
-		currentStory = "general"
-	}
-	activeScenes := make(map[int]bool)
-	activeCharacters := make(map[int]bool)
-
-	// Restore active scenes and characters from botParams
-	for _, sceneIdx := range botParams.ActiveScenes {
-		activeScenes[sceneIdx] = true
-	}
-	for _, charIdx := range botParams.ActiveCharacters {
-		activeCharacters[charIdx] = true
-	}
-
-	log.Printf("[%s] Initialized with provider=%d, mode=%s, model=%s, story=%s", botCfg.Name, selectedProvider, currentMode, botParams.CurrentModel, currentStory)
-
-	// selectStory switches the bot to the named story folder: it clears the
-	// active scenes and characters (those lists are per-story), persists the
-	// selection, and reloads the conversation context from the target story's
-	// chat history so the bot stops carrying the previous story's memory.
-	// The number of messages loaded is returned for the user-facing reply.
-	selectStory := func(name string) int {
-		currentStory = name
-		activeScenes = make(map[int]bool)
-		activeCharacters = make(map[int]bool)
-		botParams.CurrentStory = name
-		botParams.ActiveScenes = []int{}
-		botParams.ActiveCharacters = []int{}
-		saveBotParams(botCfg.Name, botParams)
-
-		// Swap in the new story's history (empty when it has no log yet).
-		conversationContext = loadStoryContext(name, botCfg.Name)
-		if conversationContext == nil {
-			conversationContext = []ContextMessage{}
-		}
-		// The tracked Telegram messages belong to the story we just left, so
-		// forget them: otherwise "del" would delete unrelated messages and trim
-		// the freshly loaded context of the new story.
-		lastUserMsgID = 0
-		lastAssistantMsgIDs = nil
-		log.Printf("[%s] Switched to story %s, loaded %d context messages", botCfg.Name, name, len(conversationContext))
-		return len(conversationContext)
-	}
-
-	// estimateTokens provides a rough estimate of token count from the context messages
-	estimateTokens := func(ctx []ContextMessage) int {
-		total := 0
-		for _, msg := range ctx {
-			total += len(msg.Content)
-		}
-		return total / 4 // rough estimate: ~4 chars per token
-	}
-
-	// sendContextWarning sends a disappearing warning if the context is getting too large
-	sendContextWarning := func(ctx []ContextMessage, numCtx int, botName string, chatID int64) {
-		if numCtx <= 0 {
-			return
-		}
-		estimatedTokens := estimateTokens(ctx)
-		if estimatedTokens == 0 {
-			return
-		}
-		// Warn if we're above 85% of the context limit
-		threshold := int(float64(numCtx) * 0.85)
-		if estimatedTokens >= threshold {
-			ctxK := numCtx / 1024
-			warning := fmt.Sprintf("⚠️ You are reaching the context limit with your chat/story. Consider increasing it from %dK (%d) using .ctxsize [nk]", ctxK, numCtx)
-			log.Printf("[%s] Context warning: estimated %d tokens of %d limit", botName, estimatedTokens, numCtx)
-			respMsg := tgbotapi.NewMessage(chatID, warning)
-			if sentMsg, err := bot.Send(respMsg); err == nil {
-				ledger.Add(sentMsg.MessageID, LedgerCommandResponse)
-				go func(cid int64, mid int) {
-					time.Sleep(deleteAfterDuration)
-					deleteMsg := tgbotapi.NewDeleteMessage(cid, mid)
-					if _, err := bot.Request(deleteMsg); err != nil {
-						log.Printf("[%s] Failed to delete warning message: %v", botName, err)
-					}
-				}(sentMsg.Chat.ID, sentMsg.MessageID)
-			}
-		}
-	}
-
 	for update := range updates {
 		if update.Message == nil || update.Message.Text == "" {
 			continue
 		}
 
 		// Only respond to the configured user ID
-		if update.Message.From.ID == userID {
-			log.Printf("[%s] Received message from user %d: %s", botCfg.Name, userID, update.Message.Text)
-
-			// Parse command from the first word of the message, strip leading dot
-			parts := strings.Fields(update.Message.Text)
-			command := strings.TrimPrefix(strings.ToLower(parts[0]), ".")
-
-			// Capture the incoming message ID in the ledger
-			// Determine if it's a command (starts with a dot) or chat_user
-			if strings.HasPrefix(parts[0], ".") {
-				ledger.Add(update.Message.MessageID, LedgerCommand)
-			} else {
-				ledger.Add(update.Message.MessageID, LedgerChatUser)
-				// Track the last non-command user message ID for /del UI cleanup
-				lastUserMsgID = update.Message.MessageID
-			}
-
-			// Guard: "nothink" / "no" shortcut should only be treated as a command
-			// when the message starts with ".", or has no other arguments, or has
-			// valid nothink arguments (on/off/think). If there are other words,
-			// send it to the AI chat handler (default case).
-			if !strings.HasPrefix(parts[0], ".") && (command == "nothink" || command == "no") {
-				if len(parts) > 1 {
-					firstArg := strings.ToLower(parts[1])
-					if firstArg != "think" && firstArg != "on" && firstArg != "off" {
-						command = "" // force to default/AI handler
-					}
-				}
-			}
-
-			var responseText string
-			// voiceThisResponse is set to true for AI-generated responses (chat and resend),
-			// so sendVoiceAudio is called after the text is sent. Command responses are not spoken.
-			voiceThisResponse := false
-			// checkContextWarn is set to true for AI-generated responses so the
-			// context-limit warning is sent after the reply (it used to be sent
-			// before the reply, which made it easy to miss).
-			checkContextWarn := false
-
-			switch command {
-			case "help", "h":
-				responseText = `🤖 i5 Assistant Help
-📚 Stories & Chapters
-• story - List story folders
-• story [n] - Select story folder (clears scenes/chars, loads its chat history)
-• story create [name] - Create a new story folder and switch to it
-• story save [name] / story load [name] - Save/load a story snapshot
-• chapter / ch - List saved chapters in the current story
-• chapter [n] / ch [n] - Pick/load listed chapter by number
-• chapter save [name] / ch save [name] - Save current chat as a chapter
-• chapter load [n|name] / ch load [n|name] - Load a saved chapter
-
-👤 Characters
-• char - List characters in current story
-• char 1 -2 3 - Multi-toggle (prefix - to deactivate)
-• char all off - Deactivate all characters
-• char edit [n] - Show character bio
-• char save [name] [text] - Save character bio
-
-🎦 Scenes
-• scene - List scenes in current story
-• scene 1 -2 3 - Multi-toggle (prefix - to deactivate)
-• scene all off - Deactivate all scenes
-• scene edit [n] - Show scene description
-• scene save [name] [text] - Save scene description
-
-🎭 Roles
-• role - List available roles
-• role [n] - Switch to role
-• role edit [n] - Get role text to edit
-• role save [name] [text] - Save role profile
-• reload - Reload role from disk
-• rs [n] - Summarize current role
-
-🧠 AI Providers & Models
-• provider / p - List providers
-• provider [n] / p [n] - Switch provider
-• model - List available models
-• model [n] - Switch model
-• model + - Next model (won't go past last)
-• model - - Previous model (won't go below first)
-• model test - Test online models for subscription requirements
-• mf [n/next/prev] - List or cycle accessible models
-• model loaded - Sync with RAM
-• think - Toggle Think Mode
-• nothink [on/off] - Toggle NoThink flag for Ollama API
-• no think [on/off] - Same as nothink
-
-• llmctx [nk] - Set/show model context window (e.g. 8k)
-
-💾 Conversation & Chats
-• chat save [name] - Save conversation
-• chat load [name] - Load conversation
-• clear - Wipe bot memory (context)
-• clean - Wipe memory and delete messages from chat UI
-• mode [chat/story] - Toggle history behavior
-• recap [n] - Summarize last 50 msgs using prompt n
-• ask [text] - Ask a question outside of roleplay context
-• del - Delete last msg + response
-• resend - Resend last user message
-• context [n] - Set/show limit
-• history [n] [full] [keep] - Show last n interactions (default 5, trunc 100 chars). Add "keep" to prevent auto-deletion
-
-⚙️ Status & Shortcuts
-• status - Show current settings
-• verbose - Toggle Verbose Status
-• trace [on/off] - Write payloads to context folder
-	• voice [on/off] - Speak AI responses as audio
-	• voice speed [1-10] - Set voice speed (10% increments)
-	• voice char [on/off] - Multi-voice character narration
-	• voice list - Show character voice assignments
-	• voice change [n] [accent] - Change a character's voice (e.g. .voice change 2 deep southern accent)
-Synonyms: r=role, rs=rolesummary, p=provider, m=model, s=status, h=help, ch=chapter, c=chat, cl=clean, mf=modelsfiltered, sc=scene, hs=history, mo=mode, mc=llmctx`
-
-			case "provider", "p":
-				if len(parts) == 1 {
-					// Just "provider" - list available models with numbers
-					var sb strings.Builder
-					sb.WriteString("Available providers:\n")
-					sortedModels := make([]ModelEntry, len(ollamaCfg.Models))
-					copy(sortedModels, ollamaCfg.Models)
-					sort.Slice(sortedModels, func(i, j int) bool {
-						return sortedModels[i].Name < sortedModels[j].Name
-					})
-					for i, model := range sortedModels {
-						if model.Name == ollamaCfg.Models[selectedProvider].Name {
-							sb.WriteString(fmt.Sprintf("  %d) %s ✅\n", i+1, model.Name))
-						} else {
-							sb.WriteString(fmt.Sprintf("  %d) %s\n", i+1, model.Name))
-						}
-					}
-					responseText = sb.String()
-					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-					continue
-				} else if len(parts) == 2 {
-					// "provider <number>" - select a provider
-					num, err := strconv.Atoi(parts[1])
-					if err != nil || num < 1 || num > len(ollamaCfg.Models) {
-						responseText = fmt.Sprintf("Invalid provider number. Please choose 1-%d.", len(ollamaCfg.Models))
-					} else {
-						// Sort providers alphabetically by name first so the numbering
-						// matches the listing shown by "provider" (without arguments).
-						sortedIndices := make([]int, len(ollamaCfg.Models))
-						for i := range sortedIndices {
-							sortedIndices[i] = i
-						}
-						sort.Slice(sortedIndices, func(i, j int) bool {
-							return ollamaCfg.Models[sortedIndices[i]].Name < ollamaCfg.Models[sortedIndices[j]].Name
-						})
-						selectedProvider = sortedIndices[num-1]
-						responseText = fmt.Sprintf("Selected provider: %s", ollamaCfg.Models[selectedProvider].Name)
-
-						// Persist the provider selection
-						botParams.SelectedProvider = selectedProvider
-						botParams.CurrentModel = ollamaCfg.Models[selectedProvider].Model
-						saveBotParams(botCfg.Name, botParams)
-
-						// Send the response and schedule deletion after 10 seconds
-						respMsg := tgbotapi.NewMessage(update.Message.Chat.ID, responseText)
-						respMsg.ParseMode = tgbotapi.ModeMarkdown
-						sentMsg, err := bot.Send(respMsg)
-						if err != nil {
-							log.Printf("[%s] Failed to send provider message: %v", botCfg.Name, err)
-						} else {
-							ledger.Add(sentMsg.MessageID, LedgerCommandResponse)
-							log.Printf("[%s] Sent provider response to user %d", botCfg.Name, userID)
-							// Schedule deletion after deleteAfterDuration
-							go func(chatID int64, messageID int) {
-								time.Sleep(deleteAfterDuration)
-								deleteMsg := tgbotapi.NewDeleteMessage(chatID, messageID)
-								if _, err := bot.Request(deleteMsg); err != nil {
-									log.Printf("[%s] Failed to delete provider message: %v", botCfg.Name, err)
-								}
-							}(sentMsg.Chat.ID, sentMsg.MessageID)
-						}
-						continue // Skip the default response sending below
-					}
-				} else {
-					responseText = "Usage: provider [number] - list or select a provider"
-				}
-
-			case "mode":
-				if len(parts) == 2 {
-					mode := strings.ToLower(parts[1])
-					if mode == "story" || mode == "chat" {
-						currentMode = mode
-						responseText = fmt.Sprintf("%s mode enabled", mode)
-
-						// Persist the mode selection
-						botParams.CurrentMode = currentMode
-						saveBotParams(botCfg.Name, botParams)
-
-						// Send the response and schedule deletion after deleteAfterDuration
-						respMsg := tgbotapi.NewMessage(update.Message.Chat.ID, responseText)
-						respMsg.ParseMode = tgbotapi.ModeMarkdown
-						sentMsg, err := bot.Send(respMsg)
-						if err != nil {
-							log.Printf("[%s] Failed to send mode message: %v", botCfg.Name, err)
-						} else {
-							ledger.Add(sentMsg.MessageID, LedgerCommandResponse)
-							log.Printf("[%s] Sent mode response to user %d", botCfg.Name, userID)
-							// Schedule deletion after deleteAfterDuration
-							go func(chatID int64, messageID int) {
-								time.Sleep(deleteAfterDuration)
-								deleteMsg := tgbotapi.NewDeleteMessage(chatID, messageID)
-								if _, err := bot.Request(deleteMsg); err != nil {
-									log.Printf("[%s] Failed to delete mode message: %v", botCfg.Name, err)
-								}
-							}(sentMsg.Chat.ID, sentMsg.MessageID)
-						}
-						continue // Skip the default response sending below
-					} else {
-						responseText = "Invalid mode. Use: mode chat or mode story"
-						sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-						continue
-					}
-				} else {
-					responseText = fmt.Sprintf("Current mode: %s\nUsage: mode [chat/story]", currentMode)
-					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-					continue
-				}
-
-			case "role", "r":
-				if len(parts) == 1 {
-					// List available roles
-					roles, err := listRoleFiles()
-					if err != nil {
-						responseText = fmt.Sprintf("Error listing roles: %v", err)
-					} else {
-						var sb strings.Builder
-						sb.WriteString("Available roles:\n")
-						for i, role := range roles {
-							if role == botParams.CurrentRole {
-								sb.WriteString(fmt.Sprintf("  %d) %s ✅\n", i+1, role))
-							} else {
-								sb.WriteString(fmt.Sprintf("  %d) %s\n", i+1, role))
-							}
-						}
-						responseText = sb.String()
-					}
-					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-					continue
-				} else if len(parts) >= 2 && parts[1] == "edit" {
-					// role edit [n] - show the role text
-					if len(parts) == 3 {
-						num, err := strconv.Atoi(parts[2])
-						if err != nil {
-							responseText = "Invalid role number."
-						} else {
-							roles, err := listRoleFiles()
-							if err != nil {
-								responseText = fmt.Sprintf("Error listing roles: %v", err)
-							} else if num < 1 || num > len(roles) {
-								responseText = fmt.Sprintf("Invalid role number. Please choose 1-%d.", len(roles))
-							} else {
-								roleName := roles[num-1]
-								content := loadRoleContent(roleName)
-								responseText = fmt.Sprintf("Role: %s\n\n%s", roleName, content)
-							}
-						}
-					} else {
-						responseText = "Usage: role edit [n] - show role text"
-					}
-				} else if len(parts) >= 3 && parts[1] == "save" {
-					// role save [name] [text] - save a new role
-					roleName := parts[2]
-					// The rest of the message after "role save [name]" is the content
-					contentStart := len("role save " + roleName + " ")
-					if len(update.Message.Text) <= contentStart {
-						responseText = "Usage: role save [name] [text] - provide role content after the name"
-					} else {
-						content := update.Message.Text[contentStart:]
-						path := fmt.Sprintf("roles/%s.txt", roleName)
-						if err := os.WriteFile(path, []byte(content), 0644); err != nil {
-							responseText = fmt.Sprintf("Failed to save role: %v", err)
-						} else {
-							responseText = fmt.Sprintf("Role '%s' saved.", roleName)
-						}
-					}
-				} else if len(parts) == 2 {
-					// role [n] - switch to role by number
-					num, err := strconv.Atoi(parts[1])
-					if err != nil {
-						responseText = "Invalid role number."
-					} else {
-						roles, err := listRoleFiles()
-						if err != nil {
-							responseText = fmt.Sprintf("Error listing roles: %v", err)
-						} else if num < 1 || num > len(roles) {
-							responseText = fmt.Sprintf("Invalid role number. Please choose 1-%d.", len(roles))
-						} else {
-							roleName := roles[num-1]
-							botParams.CurrentRole = roleName
-							saveBotParams(botCfg.Name, botParams)
-							responseText = fmt.Sprintf("Switched to role: %s", roleName)
-
-							// Send the response and schedule deletion after deleteAfterDuration
-							respMsg := tgbotapi.NewMessage(update.Message.Chat.ID, responseText)
-							respMsg.ParseMode = tgbotapi.ModeMarkdown
-							sentMsg, err := bot.Send(respMsg)
-							if err != nil {
-								log.Printf("[%s] Failed to send role message: %v", botCfg.Name, err)
-							} else {
-								ledger.Add(sentMsg.MessageID, LedgerCommandResponse)
-								log.Printf("[%s] Sent role response to user %d", botCfg.Name, userID)
-								// Schedule deletion after deleteAfterDuration
-								go func(chatID int64, messageID int) {
-									time.Sleep(deleteAfterDuration)
-									deleteMsg := tgbotapi.NewDeleteMessage(chatID, messageID)
-									if _, err := bot.Request(deleteMsg); err != nil {
-										log.Printf("[%s] Failed to delete role message: %v", botCfg.Name, err)
-									}
-								}(sentMsg.Chat.ID, sentMsg.MessageID)
-							}
-							continue // Skip the default response sending below
-						}
-					}
-				} else {
-					responseText = "Usage: role [n] - list or select a role"
-				}
-
-			case "reload":
-				// Reload the current role from disk (just confirm it exists)
-				content := loadRoleContent(botParams.CurrentRole)
-				responseText = fmt.Sprintf("Role '%s' reloaded (%d characters).", botParams.CurrentRole, len(content))
-				sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-				continue
-
-			case "clear":
-				// Clear conversation context only (no UI cleanup)
-				conversationContext = nil
-				// Sync the chat log file with the empty context (truncate)
-				chatLogPath := getChatLogPath(currentStory, botCfg.Name)
-				rewriteChatLog(chatLogPath, conversationContext, currentMode)
-				// Clear character voice assignments from memory and persist to YAML
-				voiceCharAssignments = make(map[string]string)
-				SyncVoiceAssignments(&botParams, voiceCharAssignments)
-				saveBotParams(botCfg.Name, botParams)
-				responseText = "Conversation context cleared."
-				sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-				continue
-
-			case "clean":
-				if len(parts) >= 2 && parts[1] == "cmd" {
-					// clean [cmd] - Surgical UI wipe: delete only command + command_response messages
-					// Do NOT touch conversationContext - LLM brain stays intact
-					entries := ledger.GetByTypes(LedgerCommand, LedgerCommandResponse)
-					idsToRemove := make(map[int]bool)
-					for _, e := range entries {
-						safeDeleteWithLedger(bot, update.Message.Chat.ID, e.MessageID, idsToRemove)
-					}
-					ledger.RemoveByIDs(idsToRemove)
-					responseText = "Command interface cleaned. Conversation memory preserved."
-					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-					continue
-				}
-				// clean (no args) - Full hard reset: delete ALL messages, clear ledger, reset context
-				allEntries := ledger.All()
-				idsToRemove := make(map[int]bool)
-				for _, e := range allEntries {
-					safeDeleteWithLedger(bot, update.Message.Chat.ID, e.MessageID, idsToRemove)
-				}
-				ledger.Clear()
-				conversationContext = nil
-				voiceCharAssignments = make(map[string]string)
-				SyncVoiceAssignments(&botParams, voiceCharAssignments)
-				saveBotParams(botCfg.Name, botParams)
-				responseText = "Full cleanup complete. All messages deleted and memory wiped."
-				sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-				continue
-
-			case "rs":
-				// Summarize current role
-				content := loadRoleContent(botParams.CurrentRole)
-				lines := strings.Split(content, "\n")
-				lineCount := len(lines)
-				charCount := len(content)
-				// Show first 200 chars as preview
-				preview := content
-				if len(preview) > 200 {
-					preview = preview[:200] + "..."
-				}
-				responseText = fmt.Sprintf("Role: %s\nLines: %d\nChars: %d\n\n%s", botParams.CurrentRole, lineCount, charCount, preview)
-				sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-				continue
-
-			case "del":
-				// Delete the tracked Telegram messages from UI first
-				idsToRemove := make(map[int]bool)
-				if lastUserMsgID > 0 {
-					safeDeleteWithLedger(bot, update.Message.Chat.ID, lastUserMsgID, idsToRemove)
-				}
-				for _, aid := range lastAssistantMsgIDs {
-					safeDeleteWithLedger(bot, update.Message.Chat.ID, aid, idsToRemove)
-				}
-				ledger.RemoveByIDs(idsToRemove)
-				// Reset tracking
-				lastUserMsgID = 0
-				lastAssistantMsgIDs = nil
-
-				// Delete last user+assistant exchange from memory
-				if len(conversationContext) == 0 {
-					responseText = "No messages to delete."
-				} else if currentMode == "chat" {
-					if len(conversationContext) < 2 {
-						responseText = "Not enough messages to delete a pair."
-					} else {
-						conversationContext = conversationContext[:len(conversationContext)-2]
-						responseText = "Last exchange deleted."
-					}
-				} else {
-					// Story mode: delete last assistant message only
-					conversationContext = conversationContext[:len(conversationContext)-1]
-					responseText = "Last assistant message deleted."
-				}
-				// Sync the chat log file with the trimmed context
-				chatLogPath := getChatLogPath(currentStory, botCfg.Name)
-				rewriteChatLog(chatLogPath, conversationContext, currentMode)
-				sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-				continue
-
-			case "ctxsize", "ctx":
-				if len(parts) == 2 {
-					arg := strings.ToLower(parts[1])
-					if strings.HasSuffix(arg, "k") {
-						num, err := strconv.Atoi(strings.TrimSuffix(arg, "k"))
-						if err != nil || num < 1 {
-							responseText = "Invalid context size. Use a number ending in k (e.g. 8k, 16k, 32k)."
-						} else {
-							botParams.NumCtx = num * 1024
-							saveBotParams(botCfg.Name, botParams)
-							responseText = fmt.Sprintf("Context set to %dK (%d)", num, botParams.NumCtx)
-						}
-					} else {
-						responseText = "Invalid format. Use a number ending in k (e.g. 8k, 16k, 32k)."
-					}
-				} else {
-					ctxK := botParams.NumCtx / 1024
-					responseText = fmt.Sprintf("Current context size: %dK (%d)\nUsage: .ctxsize [nk] - set the model context window (e.g. 8k, 16k, 32k)", ctxK, botParams.NumCtx)
-				}
-				sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-				continue
-
-			case "context":
-				if len(parts) == 2 {
-					num, err := strconv.Atoi(parts[1])
-					if err != nil || num < 1 {
-						responseText = "Invalid context limit. Please provide a positive number."
-					} else {
-						contextLimit = num
-						responseText = fmt.Sprintf("Context limit set to %d messages.", contextLimit)
-					}
-				} else {
-					responseText = fmt.Sprintf("Current context limit: %d messages.\nUsage: .context [n] - set the maximum number of messages to keep in context.", contextLimit)
-				}
-				sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-				continue
-
-			case "history", "hs":
-				// Parse arguments: history [n] [full] [keep]
-				keepMsg := false
-				showFull := false
-				numLines := 5
-				if len(parts) >= 2 {
-					if n, err := strconv.Atoi(parts[1]); err == nil {
-						numLines = n
-					}
-				}
-				if len(parts) >= 3 {
-					for _, arg := range parts[2:] {
-						if arg == "full" {
-							showFull = true
-						} else if arg == "keep" {
-							keepMsg = true
-						}
-					}
-				}
-
-				if len(conversationContext) == 0 {
-					responseText = "No conversation history."
-					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-					continue
-				}
-
-				var sb strings.Builder
-				sb.WriteString(fmt.Sprintf("📜 History (%d total messages, showing last %d):\n", len(conversationContext), numLines*2))
-				startIdx := len(conversationContext) - numLines*2
-				if startIdx < 0 {
-					startIdx = 0
-				}
-				for i := startIdx; i < len(conversationContext); i++ {
-					msg := conversationContext[i]
-					content := msg.Content
-					if !showFull && len(content) > 100 {
-						content = content[:100] + "..."
-					}
-					sb.WriteString(fmt.Sprintf("%d) [%s] %s\n", i+1, msg.Role, content))
-				}
-				responseText = sb.String()
-
-				if keepMsg {
-					// Send without scheduling deletion
-					respMsg := tgbotapi.NewMessage(update.Message.Chat.ID, responseText)
-					respMsg.ParseMode = tgbotapi.ModeMarkdownV2
-					sentMsg, err := bot.Send(respMsg)
-					if err != nil {
-						log.Printf("[%s] Failed to send history message: %v", botCfg.Name, err)
-						// Retry as plain text
-						respMsg.ParseMode = ""
-						sentMsg, err = bot.Send(respMsg)
-						if err != nil {
-							log.Printf("[%s] Critical failure sending history message: %v", botCfg.Name, err)
-						}
-					}
-					if err == nil {
-						ledger.Add(sentMsg.MessageID, LedgerCommandResponse)
-					}
-				} else {
-					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-				}
-				continue
-
-			case "status", "s":
-				// Build a verbose status showing all current settings
-				var sb strings.Builder
-				sb.WriteString(fmt.Sprintf("👤 User: %d\n", userID))
-
-				// Provider and model info
-				modelName := ollamaCfg.Models[selectedProvider].Model
-				sb.WriteString(fmt.Sprintf("🧠 Provider: %s\n", ollamaCfg.Models[selectedProvider].Name))
-				sb.WriteString(fmt.Sprintf("🤖 Model: %s\n", modelName))
-				ctxK := botParams.NumCtx / 1024
-				sb.WriteString(fmt.Sprintf("📐 Context: %dK (%d)\n", ctxK, botParams.NumCtx))
-
-				// Current role
-				sb.WriteString(fmt.Sprintf("🎭 Role: %s\n", botParams.CurrentRole))
-
-				// Mode
-				sb.WriteString(fmt.Sprintf("📝 Mode: %s\n", currentMode))
-
-				// Story info
-				sb.WriteString(fmt.Sprintf("📖 Story: %s\n", displayName(currentStory)))
-
-				// Active scenes
-				scenes, _ := listSceneFiles(currentStory)
-				var activeSceneNames []string
-				for idx := range activeScenes {
-					if idx >= 1 && idx <= len(scenes) {
-						activeSceneNames = append(activeSceneNames, scenes[idx-1])
-					}
-				}
-				if len(activeSceneNames) > 0 {
-					sb.WriteString(fmt.Sprintf("🎦 Scenes: %s\n", strings.Join(activeSceneNames, ", ")))
-				}
-
-				// Active characters
-				chars, _ := listCharacterFiles(currentStory)
-				var activeCharNames []string
-				for idx := range activeCharacters {
-					if idx >= 1 && idx <= len(chars) {
-						activeCharNames = append(activeCharNames, strings.TrimSuffix(chars[idx-1], ".txt"))
-					}
-				}
-				if len(activeCharNames) > 0 {
-					sb.WriteString(fmt.Sprintf("👥 Characters: %s\n", strings.Join(activeCharNames, ", ")))
-				}
-
-				// Conversation stats
-				sb.WriteString(fmt.Sprintf("💬 Memory: %d messages (limit %d)\n", len(conversationContext), contextLimit))
-
-				// Not think flag
-				if botParams.NoThink {
-					sb.WriteString("🚫 NoThink: enabled\n")
-				}
-
-				// Voice flag
-				if botParams.Voice {
-					sb.WriteString(fmt.Sprintf("🔊 Voice: enabled (speed %d)", botParams.VoiceSpeed))
-					if botParams.VoiceChar {
-						sb.WriteString(" [char mode]")
-					}
-					sb.WriteString("\n")
-				}
-
-				responseText = sb.String()
-				sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-				continue
-
-			case "think":
-				newVal := !botParams.NoThink
-				if newVal {
-					botParams.NoThink = true
-					responseText = "Think mode disabled (NoThink enabled)."
-				} else {
-					botParams.NoThink = false
-					responseText = "Think mode enabled (NoThink disabled)."
-				}
-				saveBotParams(botCfg.Name, botParams)
-				sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-				continue
-
-			case "nothink", "no":
-				if len(parts) >= 2 {
-					arg := strings.ToLower(parts[1])
-					if arg == "on" {
-						botParams.NoThink = true
-						saveBotParams(botCfg.Name, botParams)
-						responseText = "NoThink enabled."
-					} else if arg == "off" || arg == "think" {
-						botParams.NoThink = false
-						saveBotParams(botCfg.Name, botParams)
-						responseText = "NoThink disabled."
-					} else {
-						responseText = fmt.Sprintf("Current NoThink: %v\nUsage: nothink [on/off] or no think [on/off]", botParams.NoThink)
-					}
-				} else {
-					responseText = fmt.Sprintf("Current NoThink: %v\nUsage: nothink [on/off] or no think [on/off]", botParams.NoThink)
-				}
-				sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-				continue
-
-			case "verbose":
-				verboseMode := !logToFileEnabled
-				logToFileEnabled = verboseMode
-				if verboseMode {
-					responseText = "Verbose logging enabled."
-				} else {
-					responseText = "Verbose logging disabled."
-				}
-				sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-				continue
-
-			case "voice":
-				// Voice output control: .voice on/off / .voice speed <1-10> / .voice char [on/off] / .voice punct [on/off]
-				if len(parts) >= 3 && strings.ToLower(parts[1]) == "speed" {
-					// .voice speed <1-10> - set voice speed (10% increments)
-					speed, err := strconv.Atoi(parts[2])
-					if err != nil || speed < 1 || speed > 10 {
-						responseText = fmt.Sprintf("Invalid voice speed. Please choose 1-10.\nCurrent speed: %d", botParams.VoiceSpeed)
-					} else {
-						botParams.VoiceSpeed = speed
-						saveBotParams(botCfg.Name, botParams)
-						responseText = fmt.Sprintf("Voice speed set to %d (+%d%%).", speed, speed*10)
-					}
-				} else if len(parts) >= 2 && strings.ToLower(parts[1]) == "char" {
-					// .voice char [on/off] - character voice mode (multiple voices per story)
-					if len(parts) >= 3 {
-						arg := strings.ToLower(parts[2])
-						if arg == "on" {
-							botParams.VoiceChar = true
-							botParams.Voice = true // char mode implies voice is on
-							saveBotParams(botCfg.Name, botParams)
-							responseText = "Character voice mode enabled. AI responses will use multiple character-specific voices.\nVoice generation can have longer delays."
-						} else if arg == "off" {
-							botParams.VoiceChar = false
-							botParams.VoiceAssignments = nil
-							voiceCharAssignments = make(map[string]string)
-							SyncVoiceAssignments(&botParams, voiceCharAssignments)
-							saveBotParams(botCfg.Name, botParams)
-							responseText = "Character voice mode disabled. Voice assignments cleared."
-						} else {
-							responseText = fmt.Sprintf("Voice char mode is %s\nUsage: voice char [on/off]", onOff(botParams.VoiceChar))
-						}
-					} else {
-						responseText = fmt.Sprintf("Voice char mode is %s\nUsage: voice char [on/off]", onOff(botParams.VoiceChar))
-					}
-				} else if len(parts) >= 2 && strings.ToLower(parts[1]) == "punct" {
-					// .voice punct [on/off] - keep (on, default) or strip (off) punctuation
-					// in spoken audio. "off" strips punctuation from quoted dialogue, which
-					// makes Edge TTS read without pauses (legacy run-on behaviour).
-					if len(parts) >= 3 {
-						if strip, ok := resolveStripPunct(parts[2]); ok {
-							botParams.VoiceStripPunct = strip
-							saveBotParams(botCfg.Name, botParams)
-							if strip {
-								responseText = "Punctuation will be stripped from spoken dialogue (run-on mode)."
-							} else {
-								responseText = "Punctuation will be kept in spoken audio."
-							}
-						} else {
-							responseText = fmt.Sprintf("Punctuation is %s\nUsage: voice punct [on/off]", onOff(!botParams.VoiceStripPunct))
-						}
-					} else {
-						responseText = fmt.Sprintf("Punctuation is %s\nUsage: voice punct [on/off]", onOff(!botParams.VoiceStripPunct))
-					}
-				} else if len(parts) >= 2 && strings.ToLower(parts[1]) == "on" {
-					botParams.Voice = true
-					saveBotParams(botCfg.Name, botParams)
-					responseText = "Voice enabled. AI responses will include audio."
-				} else if len(parts) >= 2 && strings.ToLower(parts[1]) == "off" {
-					botParams.Voice = false
-					saveBotParams(botCfg.Name, botParams)
-					responseText = "Voice disabled."
-				} else if len(parts) >= 2 && strings.ToLower(parts[1]) == "list" {
-					// .voice list - show character→voice assignments
-					SyncVoiceAssignments(&botParams, voiceCharAssignments)
-					responseText = GetVoiceAssignmentsDisplay(voiceCharAssignments)
-				} else if len(parts) >= 4 && strings.ToLower(parts[1]) == "change" {
-					// .voice change [n] [accent] - ask AI to pick a new voice for a character
-					// The index [n] refers to the numbered list shown by .voice list
-					SyncVoiceAssignments(&botParams, voiceCharAssignments)
-					if len(voiceCharAssignments) == 0 {
-						responseText = "No character voice assignments yet. Use .voice char on and generate a response first."
-					} else {
-						num, err := strconv.Atoi(parts[2])
-						if err != nil || num < 1 || num > len(voiceCharAssignments) {
-							responseText = fmt.Sprintf("Invalid character number. Please choose 1-%d.", len(voiceCharAssignments))
-						} else {
-							// Get the character name at the given index (sorted order matches .voice list)
-							var names []string
-							for name := range voiceCharAssignments {
-								names = append(names, name)
-							}
-							sort.Strings(names)
-							characterName := names[num-1]
-
-							// The accent is everything after "voice change [n]"
-							accent := strings.TrimSpace(strings.TrimPrefix(update.Message.Text, parts[0]+" "+parts[1]+" "+parts[2]))
-							if accent == "" {
-								responseText = "Usage: voice change [n] [accent] - e.g. .voice change 2 deep southern accent"
-							} else {
-								// Send typing indicator while the AI selects a voice
-								typingAction := tgbotapi.NewChatAction(update.Message.Chat.ID, tgbotapi.ChatTyping)
-								bot.Send(typingAction)
-
-								modelEntry := ollamaCfg.Models[selectedProvider]
-								changeMsg, err := ChangeCharacterVoice(botCfg.Name, &botParams, modelEntry, ollamaCfg.APIBase, &voiceCharAssignments, characterName, accent)
-								if err != nil {
-									log.Printf("[%s] Voice change failed: %v", botCfg.Name, err)
-									responseText = fmt.Sprintf("Failed to change voice for '%s': %v", characterName, err)
-								} else {
-									responseText = changeMsg
-								}
-							}
-						}
-					}
-				} else {
-					responseText = fmt.Sprintf("Voice is %s, speed %d, char mode %s, punctuation %s\nUsage: voice on/off, voice speed 1-10, voice char on/off, voice punct on/off, voice list, voice change [n] [accent]", onOff(botParams.Voice), botParams.VoiceSpeed, onOff(botParams.VoiceChar), onOff(!botParams.VoiceStripPunct))
-				}
-				sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-				continue
-
-			case "model", "m":
-				if len(parts) >= 2 && parts[1] == "loaded" {
-					// Force re-load the model from cached file
-					loadFilteredModels()
-					filteredModelsMu.Lock()
-					models := make([]string, len(filteredModelsCache))
-					copy(models, filteredModelsCache)
-					filteredModelsMu.Unlock()
-					responseText = fmt.Sprintf("Loaded %d filtered models from disk.", len(models))
-					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-					continue
-				}
-				if len(parts) == 1 {
-					// Just "model" - list available models with numbers
-					apiKey := ollamaCfg.Models[selectedProvider].APIKey
-					models, err := listOllamaModels(getEffectiveAPIBase(ollamaCfg.Models[selectedProvider], ollamaCfg.APIBase), apiKey)
-					if err != nil {
-						responseText = fmt.Sprintf("Error fetching models: %v", err)
-					} else {
-						// Sort models to match the order displayed in the list command
-						sort.Slice(models, func(i, j int) bool {
-							return models[i].Name < models[j].Name
-						})
-						// Determine if we need to check subscription filtering (only for api.ollama.com)
-						needsFiltering := isOllamaDotCom(getEffectiveAPIBase(ollamaCfg.Models[selectedProvider], ollamaCfg.APIBase))
-						var filteredSet map[string]bool
-						if needsFiltering {
-							// Load filtered models to check which are accessible
-							loadFilteredModels()
-							filteredModelsMu.Lock()
-							filteredSet = make(map[string]bool, len(filteredModelsCache))
-							for _, f := range filteredModelsCache {
-								filteredSet[f] = true
-							}
-							filteredModelsMu.Unlock()
-						}
-						var sb strings.Builder
-						sb.WriteString("Available models:\n")
-						for i, m := range models {
-							prefix := ""
-							if needsFiltering && !filteredSet[m.Name] {
-								prefix = " ❌"
-							}
-							sizeStr := formatModelSize(m.Size)
-							if sizeStr != "" {
-								sizeStr = " (" + sizeStr + ")"
-							}
-							if m.Name == ollamaCfg.Models[selectedProvider].Model {
-								sb.WriteString(fmt.Sprintf("  %d)%s %s%s ✅\n", i+1, prefix, m.Name, sizeStr))
-							} else {
-								sb.WriteString(fmt.Sprintf("  %d)%s %s%s\n", i+1, prefix, m.Name, sizeStr))
-							}
-						}
-						responseText = sb.String()
-					}
-					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-					continue
-				} else if len(parts) == 2 && (parts[1] == "+" || parts[1] == "-") {
-					// "model +" or "model -" - cycle to next/previous model
-					apiKey := ollamaCfg.Models[selectedProvider].APIKey
-					models, err := listOllamaModels(getEffectiveAPIBase(ollamaCfg.Models[selectedProvider], ollamaCfg.APIBase), apiKey)
-					if err != nil {
-						responseText = fmt.Sprintf("Error fetching models: %v", err)
-						sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-						continue
-					}
-					{
-						// Sort models to match the order displayed in the list command
-						sort.Slice(models, func(i, j int) bool {
-							return models[i].Name < models[j].Name
-						})
-
-						currentModel := ollamaCfg.Models[selectedProvider].Model
-						currentIdx := -1
-						for i, m := range models {
-							if m.Name == currentModel {
-								currentIdx = i
-								break
-							}
-						}
-
-						if currentIdx == -1 {
-							responseText = "Current model not found in API list."
-						} else {
-							newIdx := currentIdx
-							if parts[1] == "+" {
-								// Next model, but don't go past the last one
-								if newIdx < len(models)-1 {
-									newIdx++
-								} else {
-									responseText = "Already at the last model."
-								}
-							} else { // "-"
-								// Previous model, but don't go below the first one
-								if newIdx > 0 {
-									newIdx--
-								} else {
-									responseText = "Already at the first model."
-								}
-							}
-
-							if newIdx != currentIdx {
-								ollamaCfg.Models[selectedProvider].Model = models[newIdx].Name
-								botParams.CurrentModel = models[newIdx].Name
-								saveBotParams(botCfg.Name, botParams)
-								responseText = fmt.Sprintf("Switched to model: %s", models[newIdx].Name)
-							}
-						}
-
-						// Send the response and schedule deletion after deleteAfterDuration
-						respMsg := tgbotapi.NewMessage(update.Message.Chat.ID, responseText)
-						respMsg.ParseMode = tgbotapi.ModeMarkdown
-						sentMsg, err := bot.Send(respMsg)
-						if err != nil {
-							log.Printf("[%s] Failed to send model message: %v", botCfg.Name, err)
-						} else {
-							ledger.Add(sentMsg.MessageID, LedgerCommandResponse)
-							log.Printf("[%s] Sent model response to user %d", botCfg.Name, userID)
-							go func(chatID int64, messageID int) {
-								time.Sleep(deleteAfterDuration)
-								deleteMsg := tgbotapi.NewDeleteMessage(chatID, messageID)
-								if _, err := bot.Request(deleteMsg); err != nil {
-									log.Printf("[%s] Failed to delete model message: %v", botCfg.Name, err)
-								}
-							}(sentMsg.Chat.ID, sentMsg.MessageID)
-						}
-						continue
-					}
-				} else if len(parts) >= 2 && parts[1] == "test" {
-					// "model test" - test all models for subscription/upgrade requirements
-					// This must be checked BEFORE the "model <number>" handler below,
-					// since "model test" also has len(parts) == 2.
-					// model test - test all models for subscription/upgrade requirements
-					apiKey := ollamaCfg.Models[selectedProvider].APIKey
-					models, err := listOllamaModels(getEffectiveAPIBase(ollamaCfg.Models[selectedProvider], ollamaCfg.APIBase), apiKey)
-					if err != nil {
-						responseText = fmt.Sprintf("Error fetching models: %v", err)
-						sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-						continue
-					}
-
-					responseText = fmt.Sprintf("Testing %d models for subscription requirements... This may take a while.", len(models))
-					respMsg := tgbotapi.NewMessage(update.Message.Chat.ID, responseText)
-					sentMsg, err := bot.Send(respMsg)
-					if err == nil {
-						ledger.Add(sentMsg.MessageID, LedgerCommandResponse)
-					}
-
-					modelEntry := ollamaCfg.Models[selectedProvider]
-					var accessible []string
-					var blocked []string
-
-					// Track the previous status message ID for deletion
-					var prevStatusMsgID int
-
-					for _, m := range models {
-						log.Printf("[%s] Testing model: %s", botCfg.Name, m.Name)
-
-						// Send a status message showing which model is being tested
-						statusText := fmt.Sprintf("testing model %s", m.Name)
-						statusSent := sendAndTrack(bot, update.Message.Chat.ID, statusText, &ledger)
-						if statusSent != nil {
-							// Delete the previous status message if it exists
-							if prevStatusMsgID != 0 {
-								deleteTrackedMessage(bot, update.Message.Chat.ID, prevStatusMsgID)
-							}
-							prevStatusMsgID = statusSent.MessageID
-						}
-
-						if testModelAccess(getEffectiveAPIBase(modelEntry, ollamaCfg.APIBase), modelEntry, m.Name) {
-							accessible = append(accessible, m.Name)
-						} else {
-							blocked = append(blocked, m.Name)
-						}
-					}
-
-					// Delete the last status message since we're about to show results
-					if prevStatusMsgID != 0 {
-						deleteTrackedMessage(bot, update.Message.Chat.ID, prevStatusMsgID)
-					}
-
-					saveFilteredModels(accessible)
-
-					var sb strings.Builder
-					sb.WriteString(fmt.Sprintf("✅ Accessible: %d\n", len(accessible)))
-					for _, name := range accessible {
-						sb.WriteString(fmt.Sprintf("  • %s\n", name))
-					}
-					if len(blocked) > 0 {
-						sb.WriteString(fmt.Sprintf("\n❌ Blocked (subscription/upgrade): %d\n", len(blocked)))
-						for _, name := range blocked {
-							sb.WriteString(fmt.Sprintf("  • %s\n", name))
-						}
-					}
-
-					responseText = sb.String()
-				} else if len(parts) == 2 {
-					// "model <number>" - select a model by number from the sorted list
-					num, err := strconv.Atoi(parts[1])
-					if err != nil {
-						responseText = "Usage: model [number] - list or select a model"
-					} else {
-						apiKey := ollamaCfg.Models[selectedProvider].APIKey
-						models, err := listOllamaModels(getEffectiveAPIBase(ollamaCfg.Models[selectedProvider], ollamaCfg.APIBase), apiKey)
-						if err != nil {
-							responseText = fmt.Sprintf("Error fetching models: %v", err)
-						} else if num < 1 || num > len(models) {
-							responseText = fmt.Sprintf("Invalid model number. Please choose 1-%d.", len(models))
-						} else {
-							// Sort models to match the order displayed in the list command
-							sort.Slice(models, func(i, j int) bool {
-								return models[i].Name < models[j].Name
-							})
-							ollamaCfg.Models[selectedProvider].Model = models[num-1].Name
-							botParams.CurrentModel = models[num-1].Name
-							saveBotParams(botCfg.Name, botParams)
-							responseText = fmt.Sprintf("Selected model: %s", models[num-1].Name)
-						}
-					}
-				} else {
-					responseText = "Usage: model [number] - list or select a model"
-				}
-
-			case "mf":
-				// Reload filtered models cache from disk
-				loadFilteredModels()
-
-				filteredModelsMu.Lock()
-				models := make([]string, len(filteredModelsCache))
-				copy(models, filteredModelsCache)
-				filteredModelsMu.Unlock()
-
-				if len(models) == 0 {
-					responseText = "No filtered models available. Run `.model test` first to generate the list."
-					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-					continue
-				}
-
-				if len(parts) == 1 {
-					// mf - list filtered models
-					var sb strings.Builder
-					sb.WriteString("Accessible models:\n")
-					currentModel := ollamaCfg.Models[selectedProvider].Model
-					for i, name := range models {
-						if name == currentModel {
-							sb.WriteString(fmt.Sprintf("  %d) %s ✅\n", i+1, name))
-						} else {
-							sb.WriteString(fmt.Sprintf("  %d) %s\n", i+1, name))
-						}
-					}
-					responseText = sb.String()
-					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-					continue
-				} else if len(parts) == 2 {
-					switch parts[1] {
-					case "next":
-						// Cycle to next filtered model
-						currentModel := ollamaCfg.Models[selectedProvider].Model
-						var currentIdx int = -1
-						for i, name := range models {
-							if name == currentModel {
-								currentIdx = i
-								break
-							}
-						}
-						nextIdx := (currentIdx + 1) % len(models)
-						ollamaCfg.Models[selectedProvider].Model = models[nextIdx]
-						botParams.CurrentModel = models[nextIdx]
-						saveBotParams(botCfg.Name, botParams)
-						responseText = fmt.Sprintf("Switched to model: %s", models[nextIdx])
-					case "prev":
-						// Cycle to previous filtered model
-						currentModel := ollamaCfg.Models[selectedProvider].Model
-						var currentIdx int = -1
-						for i, name := range models {
-							if name == currentModel {
-								currentIdx = i
-								break
-							}
-						}
-						prevIdx := (currentIdx - 1 + len(models)) % len(models)
-						ollamaCfg.Models[selectedProvider].Model = models[prevIdx]
-						botParams.CurrentModel = models[prevIdx]
-						saveBotParams(botCfg.Name, botParams)
-						responseText = fmt.Sprintf("Switched to model: %s", models[prevIdx])
-					default:
-						// mf [n] - select a model by number
-						num, err := strconv.Atoi(parts[1])
-						if err != nil || num < 1 || num > len(models) {
-							responseText = fmt.Sprintf("Invalid model number. Please choose 1-%d.", len(models))
-						} else {
-							ollamaCfg.Models[selectedProvider].Model = models[num-1]
-							botParams.CurrentModel = models[num-1]
-							saveBotParams(botCfg.Name, botParams)
-							responseText = fmt.Sprintf("Selected model: %s", models[num-1])
-						}
-					}
-					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-					continue
-				} else {
-					responseText = "Usage: mf [n/next/prev] - list or cycle accessible models"
-				}
-
-			case "llmctx", "mc":
-				if len(parts) == 2 {
-					arg := strings.ToLower(parts[1])
-					if strings.HasSuffix(arg, "k") {
-						num, err := strconv.Atoi(strings.TrimSuffix(arg, "k"))
-						if err != nil || num < 1 {
-							responseText = "Invalid context size. Use a number ending in k (e.g. 8k, 16k, 32k)."
-						} else {
-							botParams.NumCtx = num * 1024
-							saveBotParams(botCfg.Name, botParams)
-							responseText = fmt.Sprintf("Context set to %dK (%d)", num, botParams.NumCtx)
-						}
-					} else {
-						responseText = "Invalid format. Use a number ending in k (e.g. 8k, 16k, 32k)."
-					}
-				} else {
-					ctxK := botParams.NumCtx / 1024
-					responseText = fmt.Sprintf("Current context size: %dK (%d)\nUsage: .llmctx [nk] - set the model context window (e.g. 8k, 16k, 32k)", ctxK, botParams.NumCtx)
-				}
-				sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-				continue
-
-			case "trace":
-				if len(parts) == 2 {
-					arg := strings.ToLower(parts[1])
-					if arg == "on" {
-						logToFileEnabled = true
-						responseText = fmt.Sprintf("Trace enabled. LLM request payloads will be written to context/<bot>/ (max %d per bot).", maxTraceFilesPerBot)
-					} else if arg == "off" {
-						logToFileEnabled = false
-						responseText = "Trace disabled. No more payloads written."
-					} else {
-						responseText = fmt.Sprintf("Current trace: %v\nUsage: trace [on/off]", logToFileEnabled)
-					}
-				} else {
-					responseText = fmt.Sprintf("Current trace: %v\nUsage: trace [on/off]", logToFileEnabled)
-				}
-				sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-				continue
-
-			case "story":
-				if len(parts) == 1 {
-					// List available story folders
-					stories, err := listStoryFolders()
-					if err != nil {
-						responseText = fmt.Sprintf("Error listing stories: %v", err)
-					} else {
-						var sb strings.Builder
-						sb.WriteString("Available stories:\n")
-						for i, story := range stories {
-							if story == currentStory {
-								sb.WriteString(fmt.Sprintf("  %d) %s ✅\n", i+1, displayName(story)))
-							} else {
-								sb.WriteString(fmt.Sprintf("  %d) %s\n", i+1, displayName(story)))
-							}
-						}
-						responseText = sb.String()
-					}
-					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-					continue
-				} else if len(parts) >= 2 && parts[1] == "save" {
-					name := commandArg(update.Message.Text, 2)
-					if name == "" {
-						name = "autosave"
-					}
-					path := getStorySnapshotPath(currentStory, botCfg.Name, name)
-					if err := rewriteChatLogFile(path, conversationContext, currentMode); err != nil {
-						responseText = fmt.Sprintf("Failed to save story snapshot: %v", err)
-					} else {
-						responseText = fmt.Sprintf("Saved story snapshot '%s' for %s.", name, displayName(currentStory))
-					}
-					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-					continue
-				} else if len(parts) >= 2 && parts[1] == "load" {
-					name := commandArg(update.Message.Text, 2)
-					if name == "" {
-						name = "autosave"
-					}
-					path := getStorySnapshotPath(currentStory, botCfg.Name, name)
-					if _, err := os.Stat(path); err != nil {
-						responseText = fmt.Sprintf("No saved story snapshot named '%s' in %s.", name, displayName(currentStory))
-					} else {
-						loaded := loadChatHistory(path)
-						conversationContext = loaded
-						responseText = fmt.Sprintf("Loaded story snapshot '%s' for %s.", name, displayName(currentStory))
-					}
-					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-					continue
-				} else if len(parts) >= 2 && parts[1] == "create" {
-					// story create [name] - create a new story folder and switch to it
-					name := normalizeStoryName(commandArg(update.Message.Text, 2))
-					if name == "" {
-						responseText = "Usage: story create [name] - create a new story folder and switch to it"
-					} else if existed, err := createStoryFolders(name); err != nil {
-						responseText = fmt.Sprintf("Failed to create story '%s': %v", name, err)
-					} else {
-						loaded := selectStory(name)
-						if existed {
-							responseText = fmt.Sprintf("Story '%s' already exists — switched to it (%d messages loaded).", displayName(name), loaded)
-						} else {
-							responseText = fmt.Sprintf("Created story '%s' and switched to it.", displayName(name))
-						}
-					}
-					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-					continue
-				} else if len(parts) == 2 {
-					// story [n] - select a story by number
-					num, err := strconv.Atoi(parts[1])
-					if err != nil {
-						responseText = "Invalid story number."
-					} else {
-						stories, err := listStoryFolders()
-						if err != nil {
-							responseText = fmt.Sprintf("Error listing stories: %v", err)
-						} else if num < 1 || num > len(stories) {
-							responseText = fmt.Sprintf("Invalid story number. Please choose 1-%d.", len(stories))
-						} else {
-							loaded := selectStory(stories[num-1])
-							responseText = fmt.Sprintf("Switched to story: %s (%d messages loaded)", displayName(currentStory), loaded)
-						}
-					}
-					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-					continue
-				} else {
-					responseText = "Usage: story [n] | story create [name] | story save [name] | story load [name]"
-				}
-
-			case "chapter", "ch":
-				if len(parts) == 1 {
-					chapters, err := listStorySnapshots(currentStory, botCfg.Name)
-					if err != nil {
-						responseText = fmt.Sprintf("Error listing story chapters: %v", err)
-					} else if len(chapters) == 0 {
-						responseText = fmt.Sprintf("No saved chapters in %s yet.", displayName(currentStory))
-					} else {
-						var sb strings.Builder
-						sb.WriteString(fmt.Sprintf("Saved chapters in '%s':\n", displayName(currentStory)))
-						for i, name := range chapters {
-							sb.WriteString(fmt.Sprintf("  %d) %s\n", i+1, displayName(name)))
-						}
-						responseText = sb.String()
-					}
-					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-					continue
-				}
-				if len(parts) >= 2 && parts[1] == "save" {
-					name := commandArg(update.Message.Text, 2)
-					if name == "" {
-						name = "autosave"
-					}
-					path := getStorySnapshotPath(currentStory, botCfg.Name, name)
-					if err := rewriteChatLogFile(path, conversationContext, currentMode); err != nil {
-						responseText = fmt.Sprintf("Failed to save chapter '%s': %v", name, err)
-					} else {
-						responseText = fmt.Sprintf("Saved chapter '%s' in %s.", name, displayName(currentStory))
-					}
-					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-					continue
-				}
-				if len(parts) >= 2 && parts[1] == "load" {
-					arg := commandArg(update.Message.Text, 2)
-					if num, err := strconv.Atoi(arg); err == nil {
-						loaded, err := loadChapterSnapshotByIndex(currentStory, botCfg.Name, num)
-						if err != nil {
-							responseText = err.Error()
-						} else {
-							conversationContext = loaded
-							responseText = fmt.Sprintf("Loaded chapter #%d from %s.", num, displayName(currentStory))
-						}
-						sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-						continue
-					}
-					name := arg
-					if name == "" {
-						name = "autosave"
-					}
-					path := getStorySnapshotPath(currentStory, botCfg.Name, name)
-					if _, err := os.Stat(path); err != nil {
-						responseText = fmt.Sprintf("No saved chapter named '%s' in %s.", name, displayName(currentStory))
-					} else {
-						loaded := loadChatHistory(path)
-						conversationContext = loaded
-						responseText = fmt.Sprintf("Loaded chapter '%s' from %s.", name, displayName(currentStory))
-					}
-					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-					continue
-				}
-				if len(parts) == 2 {
-					num, err := strconv.Atoi(parts[1])
-					if err != nil {
-						responseText = "Usage: chapter [list] | chapter [n] | chapter save [name] | chapter load [number|name]"
-					} else {
-						loaded, err := loadChapterSnapshotByIndex(currentStory, botCfg.Name, num)
-						if err != nil {
-							responseText = err.Error()
-						} else {
-							conversationContext = loaded
-							responseText = fmt.Sprintf("Loaded chapter #%d from %s.", num, displayName(currentStory))
-						}
-					}
-					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-					continue
-				}
-				responseText = "Usage: chapter [list] | chapter [n] | chapter save [name] | chapter load [number|name]"
-				sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-				continue
-
-			case "scene", "sc":
-				if len(parts) == 1 {
-					// List scene files in current story
-					scenes, err := listSceneFiles(currentStory)
-					if err != nil {
-						responseText = fmt.Sprintf("Error listing scenes: %v", err)
-					} else {
-						var sb strings.Builder
-						sb.WriteString(fmt.Sprintf("Scenes in '%s':\n", displayName(currentStory)))
-						for i, s := range scenes {
-							sceneDisp := displayName(s)
-							if activeScenes[i+1] {
-								sb.WriteString(fmt.Sprintf("  %d) %s ✅\n", i+1, sceneDisp))
-							} else {
-								sb.WriteString(fmt.Sprintf("  %d) %s\n", i+1, sceneDisp))
-							}
-						}
-						responseText = sb.String()
-					}
-					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-					continue
-				} else if len(parts) >= 2 && parts[1] == "all" && len(parts) == 3 && parts[2] == "off" {
-					// scene all off
-					activeScenes = make(map[int]bool)
-					responseText = "All scenes deactivated."
-					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-					continue
-				} else if len(parts) >= 2 && parts[1] == "edit" {
-					// scene edit [n] - show scene content
-					if len(parts) == 3 {
-						num, err := strconv.Atoi(parts[2])
-						if err != nil {
-							responseText = "Invalid scene number."
-						} else {
-							scenes, err := listSceneFiles(currentStory)
-							if err != nil {
-								responseText = fmt.Sprintf("Error listing scenes: %v", err)
-							} else if num < 1 || num > len(scenes) {
-								responseText = fmt.Sprintf("Invalid scene number. Please choose 1-%d.", len(scenes))
-							} else {
-								content := loadStoryContent(currentStory, "scenes", scenes[num-1])
-								responseText = fmt.Sprintf("Scene: %s\n\n%s", scenes[num-1], content)
-							}
-						}
-					} else {
-						responseText = "Usage: scene edit [n] - show scene content"
-					}
-				} else if len(parts) >= 3 && parts[1] == "save" {
-					// scene save [name] [text] - save a new scene
-					sceneName := parts[2]
-					contentStart := len("scene save " + sceneName + " ")
-					if len(update.Message.Text) <= contentStart {
-						responseText = "Usage: scene save [name] [text] - provide scene content after the name"
-					} else {
-						content := update.Message.Text[contentStart:]
-						path := fmt.Sprintf("stories/%s/scenes/%s", currentStory, sceneName)
-						if err := os.WriteFile(path, []byte(content), 0644); err != nil {
-							responseText = fmt.Sprintf("Failed to save scene: %v", err)
-						} else {
-							responseText = fmt.Sprintf("Scene '%s' saved.", sceneName)
-						}
-					}
-				} else {
-					// Multi-toggle: scene 1 -2 3
-					scenes, err := listSceneFiles(currentStory)
-					if err != nil {
-						responseText = fmt.Sprintf("Error listing scenes: %v", err)
-					} else {
-						var toggled []string
-						for _, arg := range parts[1:] {
-							num, err := strconv.Atoi(arg)
-							if err != nil {
-								continue
-							}
-							if num < 0 {
-								// Deactivate
-								idx := -num
-								if idx >= 1 && idx <= len(scenes) {
-									delete(activeScenes, idx)
-									sceneName := scenes[idx-1]
-									toggled = append(toggled, fmt.Sprintf("%s off", sceneName))
-								}
-							} else {
-								// Activate
-								if num >= 1 && num <= len(scenes) {
-									activeScenes[num] = true
-									sceneName := scenes[num-1]
-									toggled = append(toggled, fmt.Sprintf("%s on", sceneName))
-								}
-							}
-						}
-						if len(toggled) > 0 {
-							// Persist the changes
-							var newActiveScenes []int
-							for idx := range activeScenes {
-								newActiveScenes = append(newActiveScenes, idx)
-							}
-							botParams.ActiveScenes = newActiveScenes
-							saveBotParams(botCfg.Name, botParams)
-							responseText = fmt.Sprintf("Scenes toggled:\n%s", strings.Join(toggled, "\n"))
-						} else {
-							responseText = "No valid scene numbers provided."
-						}
-					}
-				}
-
-			case "char", "c":
-				if len(parts) == 1 {
-					// List character files in current story
-					chars, err := listCharacterFiles(currentStory)
-					if err != nil {
-						responseText = fmt.Sprintf("Error listing characters: %v", err)
-					} else {
-						var sb strings.Builder
-						sb.WriteString(fmt.Sprintf("Characters in '%s':\n", displayName(currentStory)))
-						for i, c := range chars {
-							charDisp := displayName(c)
-							if activeCharacters[i+1] {
-								sb.WriteString(fmt.Sprintf("  %d) %s ✅\n", i+1, charDisp))
-							} else {
-								sb.WriteString(fmt.Sprintf("  %d) %s\n", i+1, charDisp))
-							}
-						}
-						responseText = sb.String()
-					}
-					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-					continue
-				} else if len(parts) >= 2 && parts[1] == "all" && len(parts) == 3 && parts[2] == "off" {
-					// char all off
-					activeCharacters = make(map[int]bool)
-					responseText = "All characters deactivated."
-					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-					continue
-				} else if len(parts) >= 2 && parts[1] == "edit" {
-					// char edit [n] - show character content
-					if len(parts) == 3 {
-						num, err := strconv.Atoi(parts[2])
-						if err != nil {
-							responseText = "Invalid character number."
-						} else {
-							chars, err := listCharacterFiles(currentStory)
-							if err != nil {
-								responseText = fmt.Sprintf("Error listing characters: %v", err)
-							} else if num < 1 || num > len(chars) {
-								responseText = fmt.Sprintf("Invalid character number. Please choose 1-%d.", len(chars))
-							} else {
-								content := loadStoryContent(currentStory, "characters", chars[num-1])
-								responseText = fmt.Sprintf("Character: %s\n\n%s", chars[num-1], content)
-							}
-						}
-					} else {
-						responseText = "Usage: char edit [n] - show character content"
-					}
-				} else if len(parts) >= 3 && parts[1] == "save" {
-					// char save [name] [text] - save a new character
-					charName := parts[2]
-					contentStart := len("char save " + charName + " ")
-					if len(update.Message.Text) <= contentStart {
-						responseText = "Usage: char save [name] [text] - provide character content after the name"
-					} else {
-						content := update.Message.Text[contentStart:]
-						path := fmt.Sprintf("stories/%s/characters/%s", currentStory, charName)
-						if err := os.WriteFile(path, []byte(content), 0644); err != nil {
-							responseText = fmt.Sprintf("Failed to save character: %v", err)
-						} else {
-							responseText = fmt.Sprintf("Character '%s' saved.", charName)
-						}
-					}
-				} else {
-					// Multi-toggle: char 1 -2 3
-					chars, err := listCharacterFiles(currentStory)
-					if err != nil {
-						responseText = fmt.Sprintf("Error listing characters: %v", err)
-					} else {
-						var toggled []string
-						for _, arg := range parts[1:] {
-							num, err := strconv.Atoi(arg)
-							if err != nil {
-								continue
-							}
-							if num < 0 {
-								// Deactivate
-								idx := -num
-								if idx >= 1 && idx <= len(chars) {
-									delete(activeCharacters, idx)
-									charName := strings.TrimSuffix(chars[idx-1], ".txt")
-									toggled = append(toggled, fmt.Sprintf("%s off", charName))
-								}
-							} else {
-								// Activate
-								if num >= 1 && num <= len(chars) {
-									activeCharacters[num] = true
-									charName := strings.TrimSuffix(chars[num-1], ".txt")
-									toggled = append(toggled, fmt.Sprintf("%s on", charName))
-								}
-							}
-						}
-						if len(toggled) > 0 {
-							// Persist the changes
-							var newActiveChars []int
-							for idx := range activeCharacters {
-								newActiveChars = append(newActiveChars, idx)
-							}
-							botParams.ActiveCharacters = newActiveChars
-							saveBotParams(botCfg.Name, botParams)
-							responseText = fmt.Sprintf("Characters toggled:\n%s", strings.Join(toggled, "\n"))
-						} else {
-							responseText = "No valid character numbers provided."
-						}
-					}
-				}
-
-			case "ask":
-				// Ask a question outside of roleplay context, but with access to conversation history
-				if len(parts) < 2 {
-					responseText = "Usage: ask [question] - ask a question about the conversation"
-					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-					continue
-				}
-
-				// Extract the question text (everything after ".ask")
-				question := strings.TrimSpace(strings.TrimPrefix(update.Message.Text, parts[0]))
-				if question == "" {
-					responseText = "Usage: ask [question] - ask a question about the conversation"
-					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-					continue
-				}
-
-				// Send typing indicator
-				typingAction := tgbotapi.NewChatAction(update.Message.Chat.ID, tgbotapi.ChatTyping)
-				bot.Send(typingAction)
-
-				// Use neutral system prompt instead of the current role
-				systemPrompt := "You are a helpful assistant. Answer any questions based on the provided data."
-
-				// Build injected context from active scenes and characters
-				var injectedParts []string
-
-				// Add active scenes
-				scenes, _ := listSceneFiles(currentStory)
-				var activeSceneLines []string
-				for idx := range activeScenes {
-					if idx >= 1 && idx <= len(scenes) {
-						content := loadStoryContent(currentStory, "scenes", scenes[idx-1])
-						if content != "" {
-							activeSceneLines = append(activeSceneLines, fmt.Sprintf("Scene %d (%s): %s", idx, scenes[idx-1], content))
-						} else {
-							activeSceneLines = append(activeSceneLines, fmt.Sprintf("Scene %d (%s)", idx, scenes[idx-1]))
-						}
-					}
-				}
-				if len(activeSceneLines) > 0 {
-					sort.Strings(activeSceneLines)
-					injectedParts = append(injectedParts, "[Active Scenes]\n"+strings.Join(activeSceneLines, "\n"))
-				}
-
-				// Add active characters
-				chars, _ := listCharacterFiles(currentStory)
-				var activeCharLines []string
-				for idx := range activeCharacters {
-					if idx >= 1 && idx <= len(chars) {
-						content := loadStoryContent(currentStory, "characters", chars[idx-1])
-						if content != "" {
-							activeCharLines = append(activeCharLines, fmt.Sprintf("Character %d (%s): %s", idx, chars[idx-1], content))
-						} else {
-							activeCharLines = append(activeCharLines, fmt.Sprintf("Character %d (%s)", idx, chars[idx-1]))
-						}
-					}
-				}
-				if len(activeCharLines) > 0 {
-					sort.Strings(activeCharLines)
-					injectedParts = append(injectedParts, "[Active Characters]\n"+strings.Join(activeCharLines, "\n"))
-				}
-
-				// Build a plain, neutral message: simply provide context and the question.
-				// Do NOT use buildPrompt() or defaultExecutionDirective() — those apply "Story Weaver"
-				// narrative rules which contradict the neutral system prompt of the ask command.
-				var enrichedMessage string
-				if len(injectedParts) > 0 {
-					enrichedMessage = "Context:\n" + strings.Join(injectedParts, "\n\n") + "\n\nQuestion: " + question
-				} else {
-					enrichedMessage = "Question: " + question
-				}
-
-				// Build context from conversation history (same logic as default case)
-				var apiContext []ContextMessage
-				if currentMode == "chat" {
-					// Chat mode: include all past user + assistant messages
-					apiContext = conversationContext
-				} else {
-					// Story mode: include only past assistant messages
-					for _, msg := range conversationContext {
-						if msg.Role == "assistant" {
-							apiContext = append(apiContext, msg)
-						}
-					}
-				}
-
-				// Call Ollama API
-				modelEntry := ollamaCfg.Models[selectedProvider]
-				askResponse, err := callOllamaAPI(botCfg.Name, getEffectiveAPIBase(modelEntry, ollamaCfg.APIBase), modelEntry, systemPrompt, apiContext, enrichedMessage, botParams.NumCtx, botParams.NoThink)
-				if err != nil {
-					log.Printf("[%s] Ollama API error (ask): %v", botCfg.Name, err)
-					askResponse = fmt.Sprintf("Sorry, I encountered an error: %v", err)
-				}
-
-				// Do NOT store the ask/response in conversationContext
-
-				// Send the ask response as plain text to avoid markdown parsing errors from LLM output
-				respMsg := tgbotapi.NewMessage(update.Message.Chat.ID, askResponse)
-				// NO ParseMode - send as plain text to handle LLM responses with special characters
-				if sentMsg, err := bot.Send(respMsg); err != nil {
-					log.Printf("[%s] Failed to send ask response: %v", botCfg.Name, err)
-				} else {
-					ledger.Add(sentMsg.MessageID, LedgerCommandResponse)
-					log.Printf("[%s] Sent ask response to user %d", botCfg.Name, userID)
-				}
-				continue // Skip the default response sending below
-
-			case "resend":
-				// Resend the last user message to the AI
-				if lastUserText == "" {
-					responseText = "No previous message to resend."
-					sendAndScheduleDelete(bot, update.Message.Chat.ID, responseText, &ledger)
-					continue
-				}
-
-				log.Printf("[%s] Resending last user message: %s", botCfg.Name, lastUserText)
-
-				// Send a typing indicator while we process
-				typingAction := tgbotapi.NewChatAction(update.Message.Chat.ID, tgbotapi.ChatTyping)
-				bot.Send(typingAction)
-
-				// Use the selected model entry for responses
-				modelEntry := ollamaCfg.Models[selectedProvider]
-
-				// Load the current role content as the system prompt
-				systemPrompt := loadRoleContent(botParams.CurrentRole)
-
-				// Build injected context from active scenes and characters
-				var injectedParts []string
-
-				// Add active scenes
-				scenes, _ := listSceneFiles(currentStory)
-				var activeSceneLines []string
-				for idx := range activeScenes {
-					if idx >= 1 && idx <= len(scenes) {
-						content := loadStoryContent(currentStory, "scenes", scenes[idx-1])
-						if content != "" {
-							activeSceneLines = append(activeSceneLines, fmt.Sprintf("Scene %d (%s): %s", idx, scenes[idx-1], content))
-						} else {
-							activeSceneLines = append(activeSceneLines, fmt.Sprintf("Scene %d (%s)", idx, scenes[idx-1]))
-						}
-					}
-				}
-				if len(activeSceneLines) > 0 {
-					sort.Strings(activeSceneLines)
-					injectedParts = append(injectedParts, "[Active Scenes]\n"+strings.Join(activeSceneLines, "\n"))
-				}
-
-				// Add active characters
-				chars, _ := listCharacterFiles(currentStory)
-				var activeCharLines []string
-				for idx := range activeCharacters {
-					if idx >= 1 && idx <= len(chars) {
-						content := loadStoryContent(currentStory, "characters", chars[idx-1])
-						if content != "" {
-							activeCharLines = append(activeCharLines, fmt.Sprintf("Character %d (%s): %s", idx, chars[idx-1], content))
-						} else {
-							activeCharLines = append(activeCharLines, fmt.Sprintf("Character %d (%s)", idx, chars[idx-1]))
-						}
-					}
-				}
-				if len(activeCharLines) > 0 {
-					sort.Strings(activeCharLines)
-					injectedParts = append(injectedParts, "[Active Characters]\n"+strings.Join(activeCharLines, "\n"))
-				}
-
-				// Build the final user message with injected context and an Execution Anchor
-				enrichedMessage := buildPrompt(injectedParts, lastUserText, defaultExecutionDirective())
-
-				// Do NOT re-store the user message in context - it was already stored the first time
-
-				// Build context for API based on mode
-				var apiContext []ContextMessage
-				if currentMode == "chat" {
-					// Chat mode: include all past user + assistant messages
-					apiContext = conversationContext
-				} else {
-					// Story mode: include only past assistant messages
-					for _, msg := range conversationContext {
-						if msg.Role == "assistant" {
-							apiContext = append(apiContext, msg)
-						}
-					}
-				}
-
-				// Call Ollama API for a response with context
-				responseText, err = callOllamaAPI(botCfg.Name, getEffectiveAPIBase(modelEntry, ollamaCfg.APIBase), modelEntry, systemPrompt, apiContext, enrichedMessage, botParams.NumCtx, botParams.NoThink)
-				if err != nil {
-					log.Printf("[%s] Ollama API error (resend): %v", botCfg.Name, err)
-					responseText = fmt.Sprintf("Sorry, I encountered an error contacting the AI: %v\n\nUse `resend` to resend your last message.", err)
-				}
-
-				// Store assistant response in context (both modes)
-				conversationContext = append(conversationContext, ContextMessage{Role: "assistant", Content: responseText})
-
-				// Append assistant response to chat log (both modes)
-				chatLogPath := getChatLogPath(currentStory, botCfg.Name)
-				appendToChatLog(chatLogPath, "assistant", responseText)
-
-				// Trim context if over limit
-				if len(conversationContext) > contextLimit {
-					conversationContext = conversationContext[len(conversationContext)-contextLimit:]
-				}
-
-				// Flag the context-limit warning so it is sent after the reply
-				checkContextWarn = true
-				voiceThisResponse = true
-
-			default:
-				// If the message is a single word that is not a recognized command and not "continue",
-				// send a disappearing "[msg] ignored" response to prevent misspelled commands from reaching the LLM
-				if len(parts) == 1 && command != "continue" {
-					ignoredText := fmt.Sprintf("%s ignored", parts[0])
-					respMsg := tgbotapi.NewMessage(update.Message.Chat.ID, ignoredText)
-					sentMsg, err := bot.Send(respMsg)
-					if err != nil {
-						log.Printf("[%s] Failed to send ignored message: %v", botCfg.Name, err)
-					} else {
-						ledger.Add(sentMsg.MessageID, LedgerCommandResponse)
-						log.Printf("[%s] Sent ignored response for single-word message: %s", botCfg.Name, parts[0])
-						// Schedule deletion after deleteAfterDuration
-						go func(chatID int64, messageID int) {
-							time.Sleep(deleteAfterDuration)
-							deleteMsg := tgbotapi.NewDeleteMessage(chatID, messageID)
-							if _, err := bot.Request(deleteMsg); err != nil {
-								log.Printf("[%s] Failed to delete ignored message: %v", botCfg.Name, err)
-							}
-						}(sentMsg.Chat.ID, sentMsg.MessageID)
-					}
-					continue // Skip the default response sending below
-				}
-
-				// Not a command - send to the AI using the selected provider
-				// Save the user text for potential resend
-				lastUserText = update.Message.Text
-
-				// Send a typing indicator while we process
-				typingAction := tgbotapi.NewChatAction(update.Message.Chat.ID, tgbotapi.ChatTyping)
-				bot.Send(typingAction)
-
-				// Use the selected model entry for responses
-				modelEntry := ollamaCfg.Models[selectedProvider]
-
-				// Load the current role content as the system prompt
-				systemPrompt := loadRoleContent(botParams.CurrentRole)
-
-				// Build injected context from active scenes and characters
-				var injectedParts []string
-
-				// Add active scenes
-				scenes, _ := listSceneFiles(currentStory)
-				var activeSceneLines []string
-				for idx := range activeScenes {
-					if idx >= 1 && idx <= len(scenes) {
-						content := loadStoryContent(currentStory, "scenes", scenes[idx-1])
-						if content != "" {
-							activeSceneLines = append(activeSceneLines, fmt.Sprintf("Scene %d (%s): %s", idx, scenes[idx-1], content))
-						} else {
-							activeSceneLines = append(activeSceneLines, fmt.Sprintf("Scene %d (%s)", idx, scenes[idx-1]))
-						}
-					}
-				}
-				if len(activeSceneLines) > 0 {
-					sort.Strings(activeSceneLines)
-					injectedParts = append(injectedParts, "[Active Scenes]\n"+strings.Join(activeSceneLines, "\n"))
-				}
-
-				// Add active characters
-				chars, _ := listCharacterFiles(currentStory)
-				var activeCharLines []string
-				for idx := range activeCharacters {
-					if idx >= 1 && idx <= len(chars) {
-						content := loadStoryContent(currentStory, "characters", chars[idx-1])
-						if content != "" {
-							activeCharLines = append(activeCharLines, fmt.Sprintf("Character %d (%s): %s", idx, chars[idx-1], content))
-						} else {
-							activeCharLines = append(activeCharLines, fmt.Sprintf("Character %d (%s)", idx, chars[idx-1]))
-						}
-					}
-				}
-				if len(activeCharLines) > 0 {
-					sort.Strings(activeCharLines)
-					injectedParts = append(injectedParts, "[Active Characters]\n"+strings.Join(activeCharLines, "\n"))
-				}
-
-				// Build the final user message with injected context and an Execution Anchor
-				enrichedMessage := buildPrompt(injectedParts, update.Message.Text, defaultExecutionDirective())
-
-				// Store user message in context (chat mode only)
-				if currentMode == "chat" {
-					conversationContext = append(conversationContext, ContextMessage{Role: "user", Content: update.Message.Text})
-					// Append user message to chat log
-					chatLogPath := getChatLogPath(currentStory, botCfg.Name)
-					appendToChatLog(chatLogPath, "user", update.Message.Text)
-				}
-
-				// Build context for API based on mode
-				var apiContext []ContextMessage
-				if currentMode == "chat" {
-					// Chat mode: include all past user + assistant messages
-					apiContext = conversationContext
-				} else {
-					// Story mode: include only past assistant messages
-					for _, msg := range conversationContext {
-						if msg.Role == "assistant" {
-							apiContext = append(apiContext, msg)
-						}
-					}
-				}
-
-				// Call Ollama API for a response with context
-				responseText, err = callOllamaAPI(botCfg.Name, getEffectiveAPIBase(modelEntry, ollamaCfg.APIBase), modelEntry, systemPrompt, apiContext, enrichedMessage, botParams.NumCtx, botParams.NoThink)
-				if err != nil {
-					log.Printf("[%s] Ollama API error: %v", botCfg.Name, err)
-					responseText = fmt.Sprintf("Sorry, I encountered an error contacting the AI: %v\n\nUse `resend` to resend your last message.", err)
-				}
-
-				// Store assistant response in context (both modes)
-				conversationContext = append(conversationContext, ContextMessage{Role: "assistant", Content: responseText})
-
-				// Append assistant response to chat log (both modes)
-				chatLogPath := getChatLogPath(currentStory, botCfg.Name)
-				appendToChatLog(chatLogPath, "assistant", responseText)
-
-				// Trim context if over limit
-				if len(conversationContext) > contextLimit {
-					conversationContext = conversationContext[len(conversationContext)-contextLimit:]
-				}
-
-				// Flag the context-limit warning so it is sent after the reply
-				checkContextWarn = true
-				voiceThisResponse = true
-			}
-
-			// Use a safer maximum length for MarkdownV2 to account for escape characters
-			const maxMessageLength = 3500
-			remainingText := responseText
-
-			for len(remainingText) > 0 {
-				chunk := remainingText
-				if len(chunk) > maxMessageLength {
-					chunk = chunk[:maxMessageLength]
-					// Try to break nicely at a newline or space instead of mid-word/mid-tag
-					if lastSpace := strings.LastIndexAny(chunk, " \n"); lastSpace > 2500 {
-						chunk = chunk[:lastSpace]
-					}
-				}
-
-				// Escape characters for MarkdownV2 so Telegram doesn't choke on lone symbols
-				escapedChunk := escapeMarkdown(chunk)
-
-				respMsg := tgbotapi.NewMessage(
-					update.Message.Chat.ID,
-					escapedChunk,
-				)
-				// Use MarkdownV2 for modern block/bullet styling
-				respMsg.ParseMode = tgbotapi.ModeMarkdownV2
-
-				if sentMsg, err := bot.Send(respMsg); err != nil {
-					log.Printf("[%s] Failed to send message chunk: %v", botCfg.Name, err)
-
-					// Fallback: If MarkdownV2 fails, try sending as plain text so you don't lose the message
-					respMsg.ParseMode = ""
-					if retrySent, retryErr := bot.Send(respMsg); retryErr != nil {
-						log.Printf("[%s] Critical failure sending plain text fallback: %v", botCfg.Name, retryErr)
-					} else {
-						ledger.Add(retrySent.MessageID, LedgerChatAssistant)
-					}
-					break
-				} else {
-					ledger.Add(sentMsg.MessageID, LedgerChatAssistant)
-					// Track assistant response chunk IDs for /del UI cleanup
-					lastAssistantMsgIDs = append(lastAssistantMsgIDs, sentMsg.MessageID)
-					log.Printf("[%s] Sent response chunk to user %d", botCfg.Name, userID)
-				}
-
-				remainingText = remainingText[len(chunk):]
-			}
-
-			// Send the context-limit warning after the reply so the user sees the
-			// message first (it was previously sent before the reply and easy to miss).
-			if checkContextWarn {
-				sendContextWarning(conversationContext, botParams.NumCtx, botCfg.Name, update.Message.Chat.ID)
-			}
-
-			// If this was an AI-generated response and voice is enabled, send the audio too
-			if voiceThisResponse {
-				if botParams.VoiceChar {
-					sendVoiceCharacterAudio(bot, update.Message.Chat.ID, responseText, botCfg.Name, &botParams, ollamaCfg.Models[selectedProvider], ollamaCfg.APIBase, &voiceCharAssignments, &ledger)
-				} else {
-					sendVoiceAudio(bot, update.Message.Chat.ID, responseText, botCfg.Name, &botParams)
-				}
-			}
-		} else {
+		if update.Message.From.ID != userID {
 			log.Printf("[%s] Ignored message from unauthorized user %d", botCfg.Name, update.Message.From.ID)
+			continue
 		}
+
+		log.Printf("[%s] Received message from user %d: %s", botCfg.Name, userID, update.Message.Text)
+
+		result := s.HandleMessage(IncomingMessage{
+			Text:      update.Message.Text,
+			Source:    SourceTelegram,
+			ChatID:    update.Message.Chat.ID,
+			MessageID: update.Message.MessageID,
+		})
+		if result.Text == "" {
+			continue
+		}
+
+		switch {
+		case result.IsCommand:
+			// Command replies disappear after deleteAfterDuration to keep the
+			// chat UI clean, unless the command asked to be kept.
+			if result.Persist {
+				sendChunkedMessage(bot, update.Message.Chat.ID, result.Text, &s.ledger)
+			} else {
+				sendAndScheduleDelete(bot, update.Message.Chat.ID, result.Text, &s.ledger)
+			}
+
+		case result.Plain:
+			// .ask sends plain text so LLM output containing special characters
+			// does not break Markdown parsing.
+			respMsg := tgbotapi.NewMessage(update.Message.Chat.ID, result.Text)
+			if sentMsg, serr := bot.Send(respMsg); serr != nil {
+				log.Printf("[%s] Failed to send ask response: %v", botCfg.Name, serr)
+			} else {
+				s.ledger.Add(sentMsg.MessageID, LedgerCommandResponse)
+			}
+
+		default:
+			sendAIResponse(bot, update.Message.Chat.ID, result.Text, &s.ledger, &s.lastAssistantMsgIDs, botCfg.Name, userID)
+		}
+
+		// Send the context-limit warning after the reply so the user sees the
+		// message first (it was previously sent before the reply and easy to miss).
+		if result.ContextWarn {
+			s.sendContextWarning(update.Message.Chat.ID)
+		}
+
+		// If this was an AI-generated response and voice is enabled, send the audio too
+		if result.Spoken && !result.Plain {
+			// The voice helpers replace the assignments map wholesale
+			// (*assignments = make(...)), so hand them the session field itself
+			// rather than a copy - otherwise new character voices are discarded.
+			// The mutex is already held for the whole dispatch, so reading the
+			// fields here is safe.
+			voiceParams := s.botParams
+			if voiceParams.VoiceChar {
+				sendVoiceCharacterAudio(bot, update.Message.Chat.ID, result.Text, botCfg.Name,
+					&voiceParams, s.ollamaCfg.Models[s.selectedProvider], s.ollamaCfg.APIBase,
+					&s.voiceCharAssignments, &s.ledger)
+			} else {
+				sendVoiceAudio(bot, update.Message.Chat.ID, result.Text, botCfg.Name, &voiceParams)
+			}
+		}
+	}
+}
+
+// sendAIResponse renders an AI reply to Telegram: it chunks long text, escapes
+// MarkdownV2, tracks the sent message IDs for /del, and falls back to plain
+// text when Telegram rejects the formatting.
+func sendAIResponse(bot *tgbotapi.BotAPI, chatID int64, text string, ledger *MessageLedger, assistantIDs *[]int, botName string, userID int64) {
+	// Use a safer maximum length for MarkdownV2 to account for escape characters
+	const maxMessageLength = 3500
+	remainingText := text
+
+	for len(remainingText) > 0 {
+		chunk := remainingText
+		if len(chunk) > maxMessageLength {
+			chunk = chunk[:maxMessageLength]
+			// Try to break nicely at a newline or space instead of mid-word/mid-tag
+			if lastSpace := strings.LastIndexAny(chunk, " \n"); lastSpace > 2500 {
+				chunk = chunk[:lastSpace]
+			}
+		}
+
+		// Escape characters for MarkdownV2 so Telegram doesn't choke on lone symbols
+		escapedChunk := escapeMarkdown(chunk)
+
+		respMsg := tgbotapi.NewMessage(chatID, escapedChunk)
+		// Use MarkdownV2 for modern block/bullet styling
+		respMsg.ParseMode = tgbotapi.ModeMarkdownV2
+
+		if sentMsg, err := bot.Send(respMsg); err != nil {
+			log.Printf("[%s] Failed to send message chunk: %v", botName, err)
+
+			// Fallback: If MarkdownV2 fails, try sending as plain text so you don't lose the message
+			respMsg.ParseMode = ""
+			if retrySent, retryErr := bot.Send(respMsg); retryErr != nil {
+				log.Printf("[%s] Critical failure sending plain text fallback: %v", botName, retryErr)
+			} else {
+				ledger.Add(retrySent.MessageID, LedgerChatAssistant)
+				// Track assistant response chunk IDs for /del UI cleanup
+				*assistantIDs = append(*assistantIDs, retrySent.MessageID)
+			}
+			break
+		} else {
+			ledger.Add(sentMsg.MessageID, LedgerChatAssistant)
+			// Track assistant response chunk IDs for /del UI cleanup
+			*assistantIDs = append(*assistantIDs, sentMsg.MessageID)
+			log.Printf("[%s] Sent response chunk to user %d", botName, userID)
+		}
+
+		remainingText = remainingText[len(chunk):]
 	}
 }
 
 func main() {
 	// Parse command-line flags
 	initMode := flag.Bool("init", false, "Re-run configuration wizard")
+	webPort := flag.String("port", "8080", "Web UI port (setup + chat)")
+	noWeb := flag.Bool("no-web", false, "Disable the web UI")
 	noColorFlag := flag.Bool("no-color", false, "Disable ANSI color output in setup wizard")
 	flag.Parse()
 
@@ -3580,8 +1734,26 @@ func main() {
 	// Set debug level on config
 	_ = cfg.Debug // future use
 
+	// Share config with the web backend (setup + chat + Telegram bridge).
+	setWebConfig(&cfg)
+
 	// Load the filtered models cache from disk on startup
 	loadFilteredModels()
+
+	// Start the backend-first web UI (setup wizard + chat). Runs alongside bots.
+	if noWeb != nil && *noWeb {
+		log.Println("Web UI disabled (--no-web).")
+	} else {
+		port := "8080"
+		if webPort != nil && *webPort != "" {
+			port = *webPort
+		}
+		if envPort := os.Getenv("PORT"); envPort != "" && (webPort == nil || *webPort == "8080") {
+			port = envPort
+		}
+		go startWebServer("127.0.0.1:" + port)
+		log.Printf("Open setup/chat at http://localhost:%s", port)
+	}
 
 	// Handle graceful shutdown on SIGINT/SIGTERM
 	sigChan := make(chan os.Signal, 1)
@@ -3589,10 +1761,26 @@ func main() {
 
 	var wg sync.WaitGroup
 
+	// Build and register a session for every configured bot *before* any
+	// Telegram connection is attempted. This ordering matters: if a token is
+	// invalid runBot returns early, but the session must already exist so the
+	// web transport still works for that bot.
+	for _, botCfg := range cfg.Bots {
+		session := newBotSession(botCfg, cfg.UserID, cfg.Ollama)
+		registerSession(session)
+		log.Printf("Initialized %s with provider=%d, mode=%s, model=%s, story=%s",
+			botCfg.Name, session.selectedProvider, session.currentMode,
+			session.botParams.CurrentModel, session.currentStory)
+	}
+
 	// Start a goroutine for each bot
 	for _, botCfg := range cfg.Bots {
+		session := getSession(botCfg.Name)
+		if session == nil {
+			continue
+		}
 		wg.Add(1)
-		go runBot(botCfg, cfg.UserID, cfg.Ollama, &wg)
+		go runBot(session, &wg)
 		log.Printf("Started bot goroutine: %s", botCfg.Name)
 	}
 

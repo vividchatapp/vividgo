@@ -314,9 +314,10 @@ func ChangeCharacterVoice(botName string, botParams *BotParams, modelEntry Model
 	userMsg.WriteString("Respond ONLY with a valid JSON array containing a single object in this exact format:\n")
 	userMsg.WriteString(`[{"speaker": "Character Name", "voice": "SELECTED_VOICE", "text": "A short sample line spoken by this character."}]`)
 
-	// Call the LLM with NO conversation context (per-model api_base).
+	// Call the LLM backend with NO conversation context (per-model api_base).
 	effectiveBase := getEffectiveAPIBase(modelEntry, apiBase)
-	scriptJSON, err := callOllamaAPI(botName, effectiveBase, modelEntry, systemPrompt, nil, userMsg.String(), botParams.NumCtx, botParams.NoThink)
+	_ = effectiveBase
+	scriptJSON, err := chatWithEntry(botName, modelEntry, systemPrompt, nil, userMsg.String(), botParams.NumCtx, botParams.NoThink)
 	if err != nil {
 		return "", fmt.Errorf("voice selection LLM call failed: %w", err)
 	}
@@ -345,6 +346,93 @@ func ChangeCharacterVoice(botName string, botParams *BotParams, modelEntry Model
 	return fmt.Sprintf("Voice for '%s' changed to: %s", characterName, newVoice), nil
 }
 
+// generateCharacterVoiceBytes converts text into a multi-voice spoken script
+// (roles/voiceAssistant.txt prompt) and returns the merged audio bytes, with a
+// single-voice fallback on any failure. It performs no transport I/O, so both
+// the Telegram adapter and the web transport can deliver the audio their way.
+// Character→voice assignments are reconciled and persisted as a side effect.
+func generateCharacterVoiceBytes(text string, botName string, botParams *BotParams, modelEntry ModelEntry, assignments *map[string]string) ([]byte, error) {
+	// Seed the assignments map if nil.
+	if assignments == nil {
+		m := make(map[string]string)
+		assignments = &m
+	}
+
+	systemPrompt := loadRoleContent("voiceAssistant")
+	var userMsg strings.Builder
+	userMsg.WriteString("Convert the following story/scene into a spoken script:\n\n")
+	if hint := voiceHintText(*assignments); hint != "" {
+		userMsg.WriteString(hint)
+		userMsg.WriteString("\n")
+	}
+	userMsg.WriteString(text)
+
+	scriptJSON, err := chatWithEntry(botName, modelEntry, systemPrompt, nil, userMsg.String(), botParams.NumCtx, botParams.NoThink)
+	if err != nil {
+		log.Printf("[%s] Character voice LLM call failed: %v", botName, err)
+		return speakToBytes(text, botParams.VoiceSpeed, botParams.VoiceStripPunct) // fallback to single voice
+	}
+
+	segments, err := parseVoiceSegments(scriptJSON)
+	if err != nil {
+		log.Printf("[%s] Character voice parse failed: %v", botName, err)
+		return speakToBytes(text, botParams.VoiceSpeed, botParams.VoiceStripPunct) // fallback to single voice
+	}
+
+	for i := range segments {
+		name := strings.TrimSpace(segments[i].Speaker)
+		if name == "" {
+			name = "Narrator"
+			segments[i].Speaker = name
+		}
+		if stored, ok := (*assignments)[name]; ok && stored != "" {
+			segments[i].Voice = stored
+		} else if segments[i].Voice != "" {
+			(*assignments)[name] = segments[i].Voice
+		} else {
+			segments[i].Voice = defaultVoice
+			(*assignments)[name] = defaultVoice
+		}
+	}
+	SyncVoiceAssignments(botParams, *assignments)
+	if botParams != nil {
+		saveBotParams(botName, *botParams)
+	}
+	for i, seg := range segments {
+		log.Printf("[%s] Character %d accent chosen: %s -> %s", botName, i+1, seg.Speaker, seg.Voice)
+	}
+
+	speed := botParams.VoiceSpeed
+	if speed < 1 {
+		speed = 1
+	}
+	if speed > 10 {
+		speed = 10
+	}
+	rate := fmt.Sprintf("+%d%%", speed*10)
+
+	var combined bytes.Buffer
+	totalStart := time.Now()
+	for i, seg := range segments {
+		segmentStart := time.Now()
+		segBytes, err := GenerateVoiceBuffer(seg.Text, seg.Voice, rate, botParams.VoiceStripPunct)
+		if err != nil {
+			log.Printf("[%s] Segment generation failed for %s after %s: %v", botName, seg.Speaker, time.Since(segmentStart), err)
+			return speakToBytes(text, botParams.VoiceSpeed, botParams.VoiceStripPunct) // fallback to single voice
+		}
+		combined.Write(segBytes)
+		log.Printf("[%s] Character segment %d/%d (%s -> %s) generated via edge-tts in %s, bytes=%d", botName, i+1, len(segments), seg.Speaker, seg.Voice, time.Since(segmentStart), len(segBytes))
+	}
+	if combined.Len() == 0 {
+		log.Printf("[%s] No audio generated for character voice", botName)
+		return nil, nil
+	}
+	fileExt := detectAudioExtension(combined.Bytes())
+	log.Printf("[%s] Character voice generation complete: %d segments, total duration=%s, output=%s", botName, len(segments), time.Since(totalStart), fileExt)
+	return combined.Bytes(), nil
+}
+
+
 // sendVoiceCharacterAudio converts the latest story text into a multi-voice
 // spoken script using the roles/voiceAssistant.txt system prompt. It sends the
 // merged audio as a single Telegram file and tracks character→voice assignments
@@ -361,103 +449,17 @@ func sendVoiceCharacterAudio(bot *tgbotapi.BotAPI, chatID int64, text string, bo
 
 	log.Printf("[%s] Generating character voice audio...", botName)
 
-	// Seed the assignments map if nil
-	if assignments == nil {
-		*assignments = make(map[string]string)
-	}
-
-	// Build the LLM prompt: use the voiceAssistant role as the system prompt,
-	// and send ONLY the latest response text (no chat context).
-	systemPrompt := loadRoleContent("voiceAssistant")
-
-	var userMsg strings.Builder
-	userMsg.WriteString("Convert the following story/scene into a spoken script:\n\n")
-	if hint := voiceHintText(*assignments); hint != "" {
-		userMsg.WriteString(hint)
-		userMsg.WriteString("\n")
-	}
-	userMsg.WriteString(text)
-
-	// Call the LLM with NO conversation context (only the current response text).
-	// Effective base is the per-model api_base.
-	effectiveBase := getEffectiveAPIBase(modelEntry, apiBase)
-	scriptJSON, err := callOllamaAPI(botName, effectiveBase, modelEntry, systemPrompt, nil, userMsg.String(), botParams.NumCtx, botParams.NoThink)
+	combinedBytes, err := generateCharacterVoiceBytes(text, botName, botParams, modelEntry, assignments)
 	if err != nil {
-		log.Printf("[%s] Character voice LLM call failed: %v", botName, err)
-		sendVoiceAudio(bot, chatID, text, botName, botParams) // fallback to single voice
+		log.Printf("[%s] Character voice generation failed: %v", botName, err)
 		return
 	}
-
-	segments, err := parseVoiceSegments(scriptJSON)
-	if err != nil {
-		log.Printf("[%s] Character voice parse failed: %v", botName, err)
-		sendVoiceAudio(bot, chatID, text, botName, botParams) // fallback to single voice
-		return
-	}
-
-	// Reconcile voices: keep previously-assigned voices for known characters,
-	// and remember newly-assigned ones for future turns.
-	for i := range segments {
-		name := strings.TrimSpace(segments[i].Speaker)
-		if name == "" {
-			name = "Narrator"
-			segments[i].Speaker = name
-		}
-		if stored, ok := (*assignments)[name]; ok && stored != "" {
-			// Force the stored voice so the character always sounds the same
-			segments[i].Voice = stored
-		} else if segments[i].Voice != "" {
-			// First time seeing this speaker — remember the LLM-chosen voice
-			(*assignments)[name] = segments[i].Voice
-		} else {
-			// No voice assigned by the LLM; fall back to the default narrator voice
-			segments[i].Voice = defaultVoice
-			(*assignments)[name] = defaultVoice
-		}
-	}
-	SyncVoiceAssignments(botParams, *assignments)
-	if botParams != nil {
-		saveBotParams(botName, *botParams)
-	}
-
-	// Debug: print the accent/voice chosen for each character
-	for i, seg := range segments {
-		log.Printf("[%s] Character %d accent chosen: %s -> %s", botName, i+1, seg.Speaker, seg.Voice)
-	}
-
-	// Clamp speed and build the rate string
-	speed := botParams.VoiceSpeed
-	if speed < 1 {
-		speed = 1
-	}
-	if speed > 10 {
-		speed = 10
-	}
-	rate := fmt.Sprintf("+%d%%", speed*10)
-
-	// Generate MP3 for each segment and concatenate into one combined audio file
-	var combined bytes.Buffer
-	totalStart := time.Now()
-	for i, seg := range segments {
-		segmentStart := time.Now()
-		segBytes, err := GenerateVoiceBuffer(seg.Text, seg.Voice, rate, botParams.VoiceStripPunct)
-		if err != nil {
-			log.Printf("[%s] Segment generation failed for %s after %s: %v", botName, seg.Speaker, time.Since(segmentStart), err)
-			sendVoiceAudio(bot, chatID, text, botName, botParams) // fallback to single voice
-			return
-		}
-		combined.Write(segBytes)
-		log.Printf("[%s] Character segment %d/%d (%s -> %s) generated via edge-tts in %s, bytes=%d", botName, i+1, len(segments), seg.Speaker, seg.Voice, time.Since(segmentStart), len(segBytes))
-	}
-
-	if combined.Len() == 0 {
+	if len(combinedBytes) == 0 {
 		log.Printf("[%s] No audio generated for character voice", botName)
 		return
 	}
 
-	combinedBytes := combined.Bytes()
 	fileExt := detectAudioExtension(combinedBytes)
-	log.Printf("[%s] Character voice generation complete: %d segments, total duration=%s, output=%s, bytes=%d", botName, len(segments), time.Since(totalStart), fileExt, len(combinedBytes))
 	// Send the combined audio file via Telegram using the correct extension for the actual audio format.
 	audio := tgbotapi.NewAudio(chatID, tgbotapi.FileBytes{
 		Name:  "voice_character" + fileExt,
@@ -466,6 +468,8 @@ func sendVoiceCharacterAudio(bot *tgbotapi.BotAPI, chatID int64, text string, bo
 	if sentMsg, err := bot.Send(audio); err != nil {
 		log.Printf("[%s] Failed to send character voice audio: %v", botName, err)
 	} else {
-		log.Printf("[%s] Sent character voice audio (%d segments, message ID %d)", botName, len(segments), sentMsg.MessageID)
+		log.Printf("[%s] Sent character voice audio (message ID %d)", botName, sentMsg.MessageID)
 	}
+	// Mirror the audio to open web chat pages so the browser can play it too.
+	publishVoiceAudio(botName, combinedBytes)
 }
