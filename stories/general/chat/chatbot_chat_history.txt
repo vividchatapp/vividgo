@@ -110,3 +110,19 @@ Sorry, I encountered an error contacting the AI: failed to send request: Post "h
 
 Use `resend` to resend your last message.
 
+user -----------
+hello
+
+assistant -----------
+Sorry, I encountered an error contacting the AI: failed to send request: Post "http://127.0.0.1:1/api/chat": dial tcp 127.0.0.1:1: connectex: No connection could be made because the target machine actively refused it.
+
+Use `resend` to resend your last message.
+
+user -----------
+hello
+
+assistant -----------
+Sorry, I encountered an error contacting the AI: failed to send request: Post "http://127.0.0.1:1/api/chat": dial tcp 127.0.0.1:1: connectex: No connection could be made because the target machine actively refused it.
+
+Use `resend` to resend your last message.
+

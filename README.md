@@ -1,6 +1,6 @@
 # VividGo
 
-🤖 A multi-bot Telegram AI assistant powered by Ollama, with immersive story-writing, roleplay, voice output, and cross-platform builds.
+🤖 A multi-bot Telegram AI assistant powered by Ollama and Google Gemini, with a built-in web UI (setup + chat), immersive story-writing, roleplay, voice output, and cross-platform builds.
 
 ## 🚀 Quickstart — Download the Executable for Your Operating System
 
@@ -10,6 +10,15 @@ For background-launch examples and Unix/Linux/macOS launcher scripts, see the ex
 
 ## ✨ Features
 
+### Web UI — Setup & Chat
+- Built-in web server, **enabled by default** at `http://localhost:8080` (bound to `127.0.0.1` only — not exposed to the network)
+- `/setup` — browser-based configuration editor: add and test bot tokens, add Ollama/Google providers, fetch model lists, and save `config.yaml` (alternative to the terminal wizard)
+- `/chat` — full browser chat client: bot sidebar, Markdown rendering, hover-to-copy on every message, command replies styled distinctly, and per-bot history loaded on open
+- **Live Telegram mirror** — replies sent in Telegram stream into open chat pages over Server-Sent Events, including spoken audio, which plays automatically in the browser
+- **Shared state** — the web chat and Telegram funnel through the same command dispatcher against the same session, so `.model`, `.role`, `.status`, etc. work identically on both transports and stay in sync
+- Degrades gracefully: if a Telegram token is invalid, that bot still works over the web transport
+- Disable with `--no-web`, change the port with `--port` or the `PORT` env var
+
 ### Multi-Bot Support
 - Run **multiple Telegram bots** simultaneously from a single process
 - Each bot has its own persistent configuration (`config/<botname>_bot_params.yaml`)
@@ -17,7 +26,8 @@ For background-launch examples and Unix/Linux/macOS launcher scripts, see the ex
 
 ### AI Providers & Models
 - Connect to **Ollama** (ollama.com or any local/remote Ollama instance)
-- Multiple providers with independent API keys and base URLs
+- **Google Gemini** through its OpenAI-compatible endpoint (defaults to `gemini-2.5-flash`, base `https://generativelanguage.googleapis.com/v1beta/openai`)
+- Multiple providers with independent API keys and base URLs, selectable per bot (`.provider`)
 - List, switch, and cycle models (`model`, `model +`, `model -`)
 - Test models for subscription/upgrade requirements (`model test`)
 - Filtered model list for quick cycling (`mf`)
@@ -36,6 +46,7 @@ For background-launch examples and Unix/Linux/macOS launcher scripts, see the ex
 - Load role profiles from `roles/*.txt` (e.g. Assistant, StoryWriter, AssistantX, etc.)
 - Create, edit, save, and reload roles on the fly
 - Download roles from the `vividchatapp/vivid-data` GitHub repo during setup
+- Older/experimental role files are archived under `roles/roles_old/`
 
 ### Voice Output
 - Speak AI responses as MP3 audio via Microsoft Edge's online TTS service
@@ -44,7 +55,10 @@ For background-launch examples and Unix/Linux/macOS launcher scripts, see the ex
 - Toggle per bot with `.voice [on/off]` - Speak AI responses as audio
 - `.voice speed [1-10]` - Set voice speed (10% increments)
 - `.voice char [on/off]` - Multi-voice character narration
+- `.voice list` - Show the numbered character → voice assignment list
+- `.voice change [n] [accent]` - Ask the AI to pick a new voice for character `n` from an accent description (e.g. `.voice change 2 deep southern accent`)
 - `.voice punct [on/off]` - Keep (`on`, default) or strip (`off`) punctuation in spoken audio. `off` removes punctuation from quoted dialogue, which makes Edge TTS read without pauses (legacy run-on mode)
+- Spoken replies are generated fully in memory and are also played back in the web chat
 
 ### Conversation Management
 - Persistent chat history saved to disk (`stories/<story>/chat/<bot>_chat_history.txt`)
@@ -56,7 +70,8 @@ For background-launch examples and Unix/Linux/macOS launcher scripts, see the ex
 - Auto-deleting status/command messages to keep the chat UI clean
 
 ### Setup Wizard
-- Interactive `--init` configuration wizard
+- Interactive terminal wizard on first run, or any time with `--init`
+- Browser-based alternative at `/setup` (add/test bots and providers, fetch model lists, save `config.yaml`)
 - Auto-discovers models from local Ollama instances
 - Creates directory structure and default role files
 - Downloads roles from GitHub
@@ -67,7 +82,7 @@ For background-launch examples and Unix/Linux/macOS launcher scripts, see the ex
 - [Go](https://go.dev/dl/) 1.26+
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
 - Your Telegram user ID (from [@userinfobot](https://t.me/userinfobot))
-- An Ollama API key (https://ollama.com/settings/keys) or a local Ollama instance
+- An Ollama API key (https://ollama.com/settings/keys), a local Ollama instance, or a Google AI Studio key (https://aistudio.google.com/apikey)
 
 ### Build
 
@@ -83,15 +98,26 @@ executables\build_all.ps1    # PowerShell
 ### Run
 
 ```bash
-# First run: launches the setup wizard automatically
+# First run: launches the setup wizard, then starts the bots + web UI
 ./vividgo.exe
 
 # Re-run the setup wizard with existing values
 ./vividgo.exe --init
 
-# Disable ANSI colors in the setup wizard
+# Web UI (default http://localhost:8080 — /setup and /chat)
+./vividgo.exe --port 9090     # Serve the web UI on a different port
+./vividgo.exe --no-web        # Telegram only, no web server
+
+# Disable ANSI colors in the terminal setup wizard
 ./vividgo.exe --no-color
 ```
+
+| Flag | Description |
+|------|-------------|
+| `--init` | Re-run the configuration wizard with existing values |
+| `--port [n]` | Web UI port (default `8080`; `PORT` env var is used when set) |
+| `--no-web` | Disable the web UI entirely |
+| `--no-color` | Disable ANSI colors in the terminal setup wizard |
 
 ### Configuration
 
@@ -102,13 +128,33 @@ Configuration is stored in `config.yaml`. You can also configure via environment
 | `TELEGRAM_BOT_TOKEN` | Telegram bot token (single-bot mode) |
 | `TELEGRAM_USER_ID` | Your authorized Telegram user ID |
 | `TELEGRAM_DEBUG` | Set to `true` for debug mode |
+| `PORT` | Web UI port (default `8080`) |
 | `OLLAMA_API_BASE` | Ollama API base URL (default: `https://api.ollama.com`) |
 | `OLLAMA_API_KEY` | Ollama API key |
 | `OLLAMA_MODEL` | Model to use (default: `gemma4:31b`) |
 
+## 🌐 Web UI
+
+The web server starts automatically alongside the bots (skip it with `--no-web`) and binds to `127.0.0.1` only.
+
+| URL | Description |
+|-----|-------------|
+| `/setup` | Configuration editor — Telegram user ID, bots (add/test tokens), providers (Ollama/Google, test connection, fetch model list), saves `config.yaml` |
+| `/chat` | Chat client — pick a bot in the sidebar, send messages or `.commands`, Markdown rendering, copy buttons, voice playback |
+| `/api/status` | Configured bot names |
+| `/api/config` | GET/POST the active configuration (used by `/setup`) |
+| `/api/test/telegram` | Validate a bot token and return its username |
+| `/api/test/provider` | Test a provider connection and return available models |
+| `/api/models` | List models for a provider entry |
+| `/api/chat` | Send a message to a bot; returns the reply (plus voice audio when enabled) |
+| `/api/history` | Recent chat history for a bot |
+| `/api/stream` | Server-Sent Events stream of live Telegram replies (and audio) |
+
+The web chat is a thin view: every message goes through the same `HandleMessage` dispatcher as Telegram, against the same `BotSession` state, so commands and conversation memory stay in sync across both transports.
+
 ## 📚 Commands
 
-All commands start with a dot (`.`) or can be used without it. Type `.help` in Telegram for the full list.
+All commands start with a dot (`.`) or can be used without it. Type `.help` in Telegram (or the web chat) for the full list.
 
 ### Stories & Chapters
 | Command | Description |
@@ -180,6 +226,8 @@ All commands start with a dot (`.`) or can be used without it. Type `.help` in T
 | `.voice [on/off]` | Speak AI responses as audio |
 | `.voice speed [1-10]` | Set voice speed (10% increments) |
 | `.voice char [on/off]` | Multi-voice character narration |
+| `.voice list` | Show character → voice assignments |
+| `.voice change [n] [accent]` | Pick a new voice for character n from an accent description |
 | `.voice punct [on/off]` | Keep (on, default) or strip (off) punctuation in spoken audio |
 
 **Synonyms:** `r`=role, `rs`=rolesummary, `p`=provider, `m`=model, `s`=status, `h`=help, `ch`=chapter, `c`=chat, `cl`=clean, `mf`=modelsfiltered, `sc`=scene, `hs`=history, `mo`=mode, `mc`=llmctx
@@ -188,22 +236,46 @@ All commands start with a dot (`.`) or can be used without it. Type `.help` in T
 
 ```
 vividgo/
-├── main.go                 # Main bot logic and command handlers
-├── setup.go                # Interactive setup wizard
+├── main.go                 # Telegram adapter + entry point (flags, bot goroutines)
+├── commands.go             # Transport-neutral command dispatcher (HandleMessage)
+├── session.go              # BotSession: per-bot state shared by all transports
+├── providers.go            # LLMProvider interface (Ollama + Google Gemini backends)
+├── web.go                  # Web server, JSON API, SSE stream
+├── webpages.go             # /setup and /chat HTML pages
+├── setup.go                # Terminal setup wizard
 ├── voice.go                # Edge TTS voice generation (in-memory MP3)
 ├── colors_windows.go       # ANSI color support (Windows)
 ├── colors_unix.go          # ANSI color support (Unix)
+├── commands_test.go        # Dispatcher and command parsing tests
+├── main_test.go            # Core logic tests
 ├── config.yaml             # Bot and provider configuration
 ├── config/                 # Per-bot params and filtered models
 │   ├── <bot>_bot_params.yaml
 │   └── filtered_models.txt
-├── roles/                  # Role profile text files
+├── context/                # Trace payloads (.trace on/off)
+├── roles/                  # Role profile text files (archives in roles/roles_old/)
 ├── stories/                # Story folders (chat/scenes/characters)
 └── executables/            # Cross-platform build outputs
     ├── windows_x64/        # vividgo.exe
     ├── linux_x64/          # vividgo
     ├── mac_arm64/          # vividgo
     └── ...                 # All supported platforms
+```
+
+## 🏗 Architecture
+
+The codebase is **transport-neutral**: every incoming message — whether from the Telegram long-polling loop or the web chat API — funnels through one dispatcher.
+
+- `session.go` — `BotSession` holds all per-bot runtime state (provider, model, mode, story, context, voice assignments) in a registry that is populated at startup *before* any Telegram connection is attempted. An invalid token therefore degrades to "web only" instead of taking everything down.
+- `commands.go` — `HandleMessage` parses the command, mutates the session, and returns the reply text. It never touches `tgbotapi`: Telegram-specific rendering (MarkdownV2 escaping, chunking, auto-delete, voice audio) lives in the adapter in `main.go`, and web rendering lives in `web.go`.
+- `providers.go` — an `LLMProvider` interface with Ollama and Google backends, so chat, model listing, and connection tests behave the same for both transports.
+- Command parsing differs per transport by design: Telegram accepts bare words (`model 3`), while the web chat only treats dot-prefixed (or recognized) words as commands, so ordinary chat text always reaches the LLM.
+
+## 🧪 Testing
+
+```bash
+go build ./...   # Compile everything
+go test ./...    # Run the test suite (dispatcher, parsing, core logic)
 ```
 
 ## 🔧 Cross-Platform Builds
